@@ -7,40 +7,22 @@ import { errorMessage } from '@/lib/format'
 import { useAuth } from '@/lib/auth'
 import { useI18n } from '@/lib/i18n'
 import { AuthShell } from '@/components/AuthShell'
+import { ConfirmCodeForm } from '@/components/ConfirmCodeForm'
+import { ApiError } from '@/lib/api'
 import { Alert } from '@/components/ui/Alert'
 import { Button } from '@/components/ui/Button'
 import { Field } from '@/components/ui/Field'
 
-/*
- * Working credentials for the seeded accounts, with one-click fill. Genuinely useful in front of a
- * class; a printed invitation on a page anyone can open otherwise.
- *
- * <p>Opt in, not opt out. This was `!== 'false'`, which ships the block unless somebody remembers
- * the flag at build time - and nobody did: the credentials went out with the deployed site. A
- * default that is only safe when a person remembers something is not a safe default. The flag is
- * read at build time, so with it unset the block is absent from the bundle rather than hidden in
- * it, and `.env.development` turns it back on for `next dev` without anyone having to think about
- * it.
- *
- * <p>The accounts themselves only exist where `q.seed.enabled` is true, which is the dev profile
- * alone. Publishing the passwords to a database that never had those users is still publishing
- * them: the day someone points a seeded build at the real database, the door is already open.
- */
-const SHOW_DEMO_LOGIN = process.env.NEXT_PUBLIC_SHOW_DEMO_LOGIN === 'true'
-
-const DEMO_ACCOUNTS = [
-  { roleKey: 'auth.demoOwner', email: 'owner@demo.q', password: 'demo1234' },
-  { roleKey: 'auth.demoStaff', email: 'staff@demo.q', password: 'demo1234' },
-] as const
-
 export default function LoginPage() {
   const router = useRouter()
   const { login, user, initialising } = useAuth()
-  const { t, locale } = useI18n()
+  const { t } = useI18n()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  // An account that signed up but never entered the code cannot sign in until it does.
+  const [awaitingCode, setAwaitingCode] = useState(false)
 
   useEffect(() => {
     if (!initialising && user) router.replace('/panel')
@@ -54,14 +36,31 @@ export default function LoginPage() {
       await login(email.trim(), password)
       router.replace('/panel')
     } catch (cause) {
-      setError(errorMessage(t, cause))
       setSubmitting(false)
+      if (cause instanceof ApiError && cause.code === 'ACCOUNT_NOT_CONFIRMED') {
+        setAwaitingCode(true)
+        return
+      }
+      setError(errorMessage(t, cause))
     }
+  }
+
+  if (awaitingCode) {
+    return (
+      <AuthShell>
+        <ConfirmCodeForm
+          email={email.trim()}
+          password={password}
+          intro={t('auth.notConfirmed')}
+          onConfirmed={() => router.replace('/panel')}
+        />
+      </AuthShell>
+    )
   }
 
   return (
     <AuthShell>
-      <h1 className="font-display text-3xl font-semibold tracking-tight">{t('common.signIn')}</h1>
+      <h1 className="font-display text-4xl tracking-[-0.04em]">{t('common.signIn')}</h1>
       <p className="mt-2 text-muted">{t('auth.signInSubtitle')}</p>
 
       <form onSubmit={submit} className="mt-8 space-y-4">
@@ -86,32 +85,6 @@ export default function LoginPage() {
           {t('common.signIn')}
         </Button>
       </form>
-
-      {SHOW_DEMO_LOGIN ? (
-      <div className="mt-6 rounded-xl border border-line bg-raised px-4 py-3 text-sm">
-        <p className="font-medium">{t('auth.demoTitle')}</p>
-        {DEMO_ACCOUNTS.map((account) => (
-          <p key={account.email} className="mt-1 text-muted">
-            {t(account.roleKey)}: {account.email} · {account.password}
-          </p>
-        ))}
-        <div className="mt-3 flex flex-wrap gap-3">
-          {DEMO_ACCOUNTS.map((account) => (
-            <button
-              key={account.email}
-              type="button"
-              className="rounded text-brand hover:underline"
-              onClick={() => {
-                setEmail(account.email)
-                setPassword(account.password)
-              }}
-            >
-              {t('auth.demoUse', { role: t(account.roleKey).toLocaleLowerCase(locale) })}
-            </button>
-          ))}
-        </div>
-      </div>
-      ) : null}
 
       <p className="mt-6 text-center text-sm text-muted">
         {t('auth.noAccount')}{' '}

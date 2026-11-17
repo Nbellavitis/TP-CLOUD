@@ -113,6 +113,9 @@ export default function PanelHomePage() {
             <h1 className="font-display text-3xl font-semibold tracking-tight">{t('panel.today')}</h1>
             <p className="mt-1 text-sm text-muted">{activeEstablishment.name}</p>
           </div>
+          <ButtonLink href="/panel/analytics" variant="secondary" size="sm">
+            {t('panel.openAnalytics')}
+          </ButtonLink>
         </div>
 
         <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -186,7 +189,7 @@ function QueueCard({ queue, board }: { queue: QueueView; board: QueueSnapshot | 
   const { t } = useI18n()
 
   return (
-    <Card className="flex min-w-0 flex-col">
+    <Card className="interactive-card flex min-w-0 flex-col">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="truncate font-display text-lg font-semibold tracking-tight">{queue.name}</h3>
