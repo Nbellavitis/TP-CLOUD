@@ -257,3 +257,37 @@ run "tope_de_athena_invalido" {
 
   expect_failures = [var.athena_scan_limit_mb]
 }
+
+run "lo_que_no_tiene_dlq_tambien_avisa" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.stream_lag.metric_name == "IteratorAge" && aws_cloudwatch_metric_alarm.stream_lag.dimensions.FunctionName == "q-stream-publisher"
+    error_message = "Un stream atrasado avisa antes de que algo llegue a q-stream-failures."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.analytics_refresh_errors.period == 300 && aws_cloudwatch_metric_alarm.analytics_refresh_errors.datapoints_to_alarm == 2
+    error_message = "El refresher avisa si falla dos vueltas seguidas, con el período de su regla."
+  }
+
+  assert {
+    condition = alltrue([
+      for alarm in [aws_cloudwatch_metric_alarm.lake_conversion_failures, aws_cloudwatch_metric_alarm.lake_delivery_failures] :
+      alarm.namespace == "AWS/Firehose" && alarm.dimensions.DeliveryStreamName == "q-visitas"
+    ])
+    error_message = "Las fallas de Firehose, que van a errores/ sin pasar por una cola, también avisan."
+  }
+
+  assert {
+    condition = alltrue([
+      for alarm in [
+        aws_cloudwatch_metric_alarm.stream_lag,
+        aws_cloudwatch_metric_alarm.analytics_refresh_errors,
+        aws_cloudwatch_metric_alarm.lake_conversion_failures,
+        aws_cloudwatch_metric_alarm.lake_delivery_failures,
+      ] : alarm.treat_missing_data == "notBreaching"
+    ])
+    error_message = "Sin tráfico no hay métrica, y eso no es una falla."
+  }
+}
