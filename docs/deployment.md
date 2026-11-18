@@ -1,7 +1,7 @@
 # Deploying Queue
 
 This is the operator's guide for the Tercera Entrega. Follow it from a branch of the submission
-repository. The [main README](../README.md#4-terraform) explains modules, variables,
+repository. The [main README](../README.md#7-terraform) explains modules, variables,
 outputs, functions, meta-arguments and TP2 corrections. The [architecture](architecture.md)
 describes the deployed system and its delivery limits. The source of pipeline behavior is
 [terraform.yml](../.github/workflows/terraform.yml).
@@ -199,7 +199,7 @@ output into the submission, a screenshot or an issue.
 
 Defaults are demo enabled, simulated emails unless configured, no alarm email subscriber, stage
 `prod`, region `us-east-1`, log retention 14 days and staff sessions 12 hours. Every variable/default
-is listed in the [main README](../README.md#46-variables-y-outputs).
+is listed in the [main README](../README.md#76-variables-y-outputs).
 
 Local `terraform.tfvars` is ignored and is not loaded by the hosted runner. The workflow passes
 the optional email variables and `TF_VAR_api_stage_name` from `API_STAGE` in both plan and destroy.
