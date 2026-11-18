@@ -451,6 +451,20 @@ jobs:
           # Destruir nunca crea el backend: si no hay estado, no hay nada que destruir o se perdió.
           create-state-bucket: "false"
 
+      # AWS no deja borrar un tópico con el archivo de mensajes activo: primero hay que desactivarlo, lo
+      # que también borra lo archivado. El ARN sale del estado; si el tópico no está, no hay nada que hacer.
+      - name: Desactivar el archivo de eventos
+        if: steps.init.outputs.state-found == 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          topic=$(terraform state show -no-color aws_sns_topic.queue_events 2>/dev/null | awk -F'"' '/^ *arn *=/ { print $2; exit }')
+          if [ -n "$topic" ] && aws sns get-topic-attributes --topic-arn "$topic" >/dev/null 2>&1; then
+            aws sns set-topic-attributes --topic-arn "$topic" --attribute-name ArchivePolicy --attribute-value '{}'
+            echo "Archivo desactivado: $topic"
+          else
+            echo "El tópico de eventos no existe: nada que desactivar."
+          fi
+
       # Sin refresh: refrescar un bucket creado con `aws_s3_bucket` (como el que dejó la primera
       # corrida) repite la lectura de object lock que el SCP del lab niega, y el destroy fallaría
       # antes de borrar nada. Destruir lo que dice el estado alcanza.

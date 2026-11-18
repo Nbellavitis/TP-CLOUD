@@ -17,6 +17,15 @@ resource "aws_sns_topic" "queue_events" {
   # La deduplicación la da el id de cada evento: un registro del stream reprocesado no se publica dos
   # veces en una ventana de 5 minutos.
   content_based_deduplication = false
+
+  # El archivo de eventos: el tópico guarda cada mensaje que publica y los puede volver a entregar a
+  # una sola suscripción, desde la fecha que se le pida. Sin esto, un evento sale al bus y no queda en
+  # ningún lado (el ítem del outbox vence a los 30 días y el stream lo retiene 24 horas). Sirve para
+  # poner al día un consumidor nuevo o rehacer el trabajo de uno que procesó mal. Reproducir es seguro
+  # porque los consumidores releen el estado: un evento viejo no reenvía un aviso ya mandado.
+  #
+  # Con el archivo activo, AWS no deja borrar el tópico: el destroy del pipeline lo desactiva antes.
+  archive_policy = var.events_archive_days == 0 ? null : jsonencode({ MessageRetentionPeriod = var.events_archive_days })
 }
 
 module "queues" {

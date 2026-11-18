@@ -257,6 +257,17 @@ variable "waf_public_rate_limit" {
   }
 }
 
+variable "events_archive_days" {
+  description = "Días que el tópico de eventos guarda cada mensaje para poder reproducirlo (archivo de SNS FIFO). 0 lo desactiva. Pasar de activo a 0 no lo apaga solo: hay que poner su ArchivePolicy en {} con la CLI."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = floor(var.events_archive_days) == var.events_archive_days && var.events_archive_days >= 0 && var.events_archive_days <= 365
+    error_message = "SNS archiva de 1 a 365 días; 0 desactiva el archivo."
+  }
+}
+
 variable "lake_buffer_seconds" {
   description = "Cada cuánto escribe Firehose un archivo en el data lake, si no juntó antes 64 MB. Más alto, archivos más grandes y menos; más bajo, una visita aparece antes en el lake."
   type        = number

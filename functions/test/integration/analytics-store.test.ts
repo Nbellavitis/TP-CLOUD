@@ -54,4 +54,12 @@ describe('AnalyticsStore contra DynamoDB Local', () => {
     const figures = await store.figures({ establishmentId: 'est-c', from: '2026-02-01', to: '2026-02-01' })
     expect(figures.summary).toMatchObject({ visits: 3, served: 3, averageWaitMinutes: 10, p90WaitMinutes: 10 })
   })
+
+  it('guarda el pedido de recálculo completo hasta que vence', async () => {
+    const now = new Date('2026-03-02T15:00:00.000Z')
+    expect(await store.fullRefreshRequested(now)).toBe(false)
+    await store.requestFullRefresh(new Date('2026-03-02T15:30:00.000Z'))
+    expect(await store.fullRefreshRequested(now)).toBe(true)
+    expect(await store.fullRefreshRequested(new Date('2026-03-02T15:31:00.000Z'))).toBe(false)
+  })
 })

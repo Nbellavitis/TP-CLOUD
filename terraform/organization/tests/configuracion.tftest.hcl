@@ -155,6 +155,38 @@ run "tope_de_waf_invalido" {
   expect_failures = [var.waf_public_rate_limit]
 }
 
+run "el_topico_archiva_los_eventos" {
+  command = plan
+
+  assert {
+    condition     = jsondecode(aws_sns_topic.queue_events.archive_policy).MessageRetentionPeriod == 90
+    error_message = "Por defecto el tópico guarda 90 días de eventos para poder reproducirlos."
+  }
+}
+
+run "sin_archivo_de_eventos" {
+  command = plan
+
+  variables {
+    events_archive_days = 0
+  }
+
+  assert {
+    condition     = aws_sns_topic.queue_events.archive_policy == null
+    error_message = "Con 0 días el tópico no archiva."
+  }
+}
+
+run "archivo_de_eventos_demasiado_largo" {
+  command = plan
+
+  variables {
+    events_archive_days = 400
+  }
+
+  expect_failures = [var.events_archive_days]
+}
+
 run "el_lake_recibe_solo_visitas_terminadas_particionadas_por_dia" {
   command = plan
 
@@ -220,8 +252,18 @@ run "athena_recalcula_el_tablero_con_un_tope_de_escaneo" {
   command = plan
 
   assert {
-    condition     = aws_cloudwatch_event_rule.analytics_refresh.schedule_expression == "rate(5 minutes)"
-    error_message = "Por defecto los agregados se recalculan cada 5 minutos."
+    condition     = aws_cloudwatch_event_rule.analytics_refresh["recent"].schedule_expression == "rate(5 minutes)"
+    error_message = "Por defecto los últimos días se recalculan cada 5 minutos."
+  }
+
+  assert {
+    condition     = jsondecode(aws_cloudwatch_event_target.analytics_refresh["recent"].input).window == "recent" && jsondecode(aws_cloudwatch_event_target.analytics_refresh["full"].input).window == "full"
+    error_message = "La regla frecuente pide la vuelta corta y la diaria la ventana entera."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.analytics_refresh["full"].schedule_expression == "cron(0 7 * * ? *)"
+    error_message = "La ventana entera se recalcula una vez por día, de madrugada en Argentina."
   }
 
   assert {
@@ -243,7 +285,7 @@ run "recalculo_cada_un_minuto" {
   }
 
   assert {
-    condition     = aws_cloudwatch_event_rule.analytics_refresh.schedule_expression == "rate(1 minute)"
+    condition     = aws_cloudwatch_event_rule.analytics_refresh["recent"].schedule_expression == "rate(1 minute)"
     error_message = "EventBridge pide el singular para un minuto."
   }
 }
@@ -256,4 +298,38 @@ run "tope_de_athena_invalido" {
   }
 
   expect_failures = [var.athena_scan_limit_mb]
+}
+
+run "lo_que_no_tiene_dlq_tambien_avisa" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.stream_lag.metric_name == "IteratorAge" && aws_cloudwatch_metric_alarm.stream_lag.dimensions.FunctionName == "q-stream-publisher"
+    error_message = "Un stream atrasado avisa antes de que algo llegue a q-stream-failures."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.analytics_refresh_errors.period == 300 && aws_cloudwatch_metric_alarm.analytics_refresh_errors.datapoints_to_alarm == 2
+    error_message = "El refresher avisa si falla dos vueltas seguidas, con el período de su regla."
+  }
+
+  assert {
+    condition = alltrue([
+      for alarm in [aws_cloudwatch_metric_alarm.lake_conversion_failures, aws_cloudwatch_metric_alarm.lake_delivery_failures] :
+      alarm.namespace == "AWS/Firehose" && alarm.dimensions.DeliveryStreamName == "q-visitas"
+    ])
+    error_message = "Las fallas de Firehose, que van a errores/ sin pasar por una cola, también avisan."
+  }
+
+  assert {
+    condition = alltrue([
+      for alarm in [
+        aws_cloudwatch_metric_alarm.stream_lag,
+        aws_cloudwatch_metric_alarm.analytics_refresh_errors,
+        aws_cloudwatch_metric_alarm.lake_conversion_failures,
+        aws_cloudwatch_metric_alarm.lake_delivery_failures,
+      ] : alarm.treat_missing_data == "notBreaching"
+    ])
+    error_message = "Sin tráfico no hay métrica, y eso no es una falla."
+  }
 }

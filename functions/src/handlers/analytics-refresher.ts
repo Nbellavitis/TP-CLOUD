@@ -1,11 +1,17 @@
-// λ analytics-refresher: cada tanto (EventBridge Scheduler) recalcula con Athena los agregados
-// diarios de los últimos días y los deja en DynamoDB, que es de donde lee el tablero.
+// λ analytics-refresher: recalcula con Athena los agregados diarios del tablero y los deja en
+// DynamoDB, que es de donde lee el panel. La dispara EventBridge con dos reglas:
 //
-// Recalcula la ventana entera en cada vuelta en lugar de sumar lo nuevo: no hay estado incremental
-// que se pueda desfasar, un hecho que llegó tarde o repetido se corrige solo en la vuelta siguiente,
-// y dos ejecuciones superpuestas escriben lo mismo. Lo que escanea está acotado por la ventana: con
-// el lake particionado por día, Athena abre solo esas carpetas, y por ser Parquet, solo las columnas
-// que usa la consulta.
+//   - cada pocos minutos, la vuelta corta (`recent`): solo los últimos días. Son los únicos que
+//     cambian, porque el lake solo agrega archivos y una visita cae en el día en que terminó;
+//   - una vez por día, la vuelta completa (`full`): toda la ventana del tablero. Corrige lo que haya
+//     llegado tarde o repetido a un día viejo.
+//
+// Recalcular solo dos días en lugar de noventa baja lo que Athena escanea y lo que se escribe en
+// DynamoDB en un 97 %. Cada vuelta recalcula sus días desde el lake, sin sumar sobre lo anterior: no
+// hay estado incremental que se pueda desfasar, y dos ejecuciones superpuestas escriben lo mismo.
+//
+// El historial de demo carga días viejos: deja un pedido de recálculo completo (`fullRefreshRequested`)
+// y, mientras está vigente, las vueltas cortas también recalculan la ventana entera.
 
 import { AthenaClient, GetQueryExecutionCommand, GetQueryResultsCommand, StartQueryExecutionCommand } from '@aws-sdk/client-athena'
 import type { GetQueryExecutionCommandOutput, GetQueryResultsCommandOutput } from '@aws-sdk/client-athena'
@@ -20,20 +26,33 @@ type AthenaCommand = StartQueryExecutionCommand | GetQueryExecutionCommand | Get
 
 export interface RefresherDependencies {
   athena: { send(command: AthenaCommand): Promise<unknown> }
-  store: { putDays(days: readonly DailyAggregate[], refreshedAt: Date): Promise<void> }
+  store: {
+    putDays(days: readonly DailyAggregate[], refreshedAt: Date): Promise<void>
+    fullRefreshRequested(now: Date): Promise<boolean>
+  }
   workgroup: string
   database: string
   table: string
-  /** Cuántos días hacia atrás se recalculan: los del rango más largo del tablero. */
+  /** Cuántos días hacia atrás recalcula la vuelta completa: los del rango más largo del tablero. */
   windowDays: number
   now?: () => Date
   pause?: (milliseconds: number) => Promise<void>
 }
 
+/**
+ * Cuántos días hacia atrás recalcula la vuelta corta. Hoy y ayer del local, más uno de margen: el día
+ * se toma en UTC, y para un local al oeste de UTC el día local puede ser el anterior.
+ */
+export const RECENT_DAYS = 2
+
+/** `recent`: los últimos días, cada pocos minutos. `full`: la ventana entera, una vez por día. */
+export type RefreshWindow = 'recent' | 'full'
+
 const POLL_MILLISECONDS = 1000
 const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
 
 export interface RefreshResult {
+  window: RefreshWindow
   queryExecutionId: string
   since: string
   days: number
@@ -41,11 +60,16 @@ export interface RefreshResult {
   bytesScanned: number
 }
 
-export async function refresh(deps: RefresherDependencies, deadline: () => number = () => Infinity): Promise<RefreshResult> {
+export async function refresh(
+  deps: RefresherDependencies,
+  deadline: () => number = () => Infinity,
+  requested: RefreshWindow = 'full',
+): Promise<RefreshResult> {
   const now = deps.now?.() ?? new Date()
   const pause = deps.pause ?? sleep
+  const window: RefreshWindow = requested === 'full' || (await deps.store.fullRefreshRequested(now)) ? 'full' : 'recent'
   // Un día de margen: el día local de un local al oeste de UTC puede ser el anterior al de UTC.
-  const since = addDays(now.toISOString().slice(0, 10), -deps.windowDays)
+  const since = addDays(now.toISOString().slice(0, 10), -(window === 'full' ? deps.windowDays : RECENT_DAYS))
 
   const started = (await deps.athena.send(
     new StartQueryExecutionCommand({
@@ -84,6 +108,7 @@ export async function refresh(deps: RefresherDependencies, deadline: () => numbe
   const days = parseRows(rows)
   await deps.store.putDays(days, now)
   return {
+    window,
     queryExecutionId,
     since,
     days: days.length,
@@ -93,7 +118,12 @@ export async function refresh(deps: RefresherDependencies, deadline: () => numbe
 
 let deps: RefresherDependencies | undefined
 
-export const handler = async (_event: unknown, context?: { getRemainingTimeInMillis?: () => number }): Promise<RefreshResult> => {
+/** Lo que manda EventBridge en cada regla. Invocada a mano, sin `window`, recalcula todo. */
+export interface RefreshEvent {
+  window?: RefreshWindow
+}
+
+export const handler = async (event: RefreshEvent | null | undefined, context?: { getRemainingTimeInMillis?: () => number }): Promise<RefreshResult> => {
   deps ??= {
     athena: new AthenaClient({}),
     store: new AnalyticsStore(createTableConfig()),
@@ -102,7 +132,8 @@ export const handler = async (_event: unknown, context?: { getRemainingTimeInMil
     table: required('GLUE_TABLE'),
     windowDays: Number(required('WINDOW_DAYS')),
   }
-  const result = await refresh(deps, () => context?.getRemainingTimeInMillis?.() ?? Infinity)
+  const window: RefreshWindow = event?.window === 'recent' ? 'recent' : 'full'
+  const result = await refresh(deps, () => context?.getRemainingTimeInMillis?.() ?? Infinity, window)
   console.log('Agregados recalculados', JSON.stringify(result))
   return result
 }
