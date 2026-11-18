@@ -101,7 +101,7 @@ Two paths, and the line between them is the DynamoDB transaction:
 | 10 Lambdas, TypeScript on Node 22 | The API, the consumers, the analytics, the seed | Short cold starts without SnapStart; one language with the frontend; small single-file bundles |
 | DynamoDB `q-main` | Every item but the users, in one table | Every operation is per queue; one partition per queue gives transactions over a queue's items and ordered reads by prefix |
 | DynamoDB Streams | The source of every asynchronous action | Fires for committed writes; ordering is guaranteed per item |
-| SNS FIFO + SQS | Fan-out, filtering and buffering per consumer | Each consumer gets its own queue, retries, DLQ and concurrency limit |
+| SNS FIFO + SQS | Fan-out, filtering and buffering per consumer; the topic archives every event for 90 days | Each consumer gets its own queue, retries, DLQ and concurrency limit. The archive replays events to one subscription, to catch up a new consumer or redo the work of one that processed wrongly |
 | Cognito | Staff accounts | Removes the hand-rolled login, password hashing and the JWT secret; API Gateway validates tokens without running a Lambda |
 | Gmail SMTP | Notification emails | The lab denies SES to every role. Gmail's SMTP server delivers to any address, with the group's account and an app password |
 | Secrets Manager | That app password, the only secret | Encrypted at rest and read with the lab's role; the pipeline writes the value, so it is in no file, plan or state |
@@ -217,7 +217,9 @@ shape it:
   computed in advance (`ANALYTICS#`, one item per establishment and day), which Athena recalculates.
 * **Order keys are fractional strings**, so inserting between neighbours never renumbers the line.
 * **Events have their own partition per queue**, ordered by the queue's version, and expire after 30
-  days through TTL. Only their insertion matters to the stream.
+  days through TTL. Only their insertion matters to the stream: these items are the outbox. The
+  history lives in the SNS FIFO topic's archive (90 days), which can replay events to a single
+  subscription from a chosen date.
 * **No counters.** Every change already reads the queue's active entries, so capacity is counted on
   what was read, under the same version. A stored count would be a second copy that can drift.
 * **Two tables, not one.** `q-connections` holds one item per open WebSocket, with a `byQueue`

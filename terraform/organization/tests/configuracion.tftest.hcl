@@ -155,6 +155,38 @@ run "tope_de_waf_invalido" {
   expect_failures = [var.waf_public_rate_limit]
 }
 
+run "el_topico_archiva_los_eventos" {
+  command = plan
+
+  assert {
+    condition     = jsondecode(aws_sns_topic.queue_events.archive_policy).MessageRetentionPeriod == 90
+    error_message = "Por defecto el tópico guarda 90 días de eventos para poder reproducirlos."
+  }
+}
+
+run "sin_archivo_de_eventos" {
+  command = plan
+
+  variables {
+    events_archive_days = 0
+  }
+
+  assert {
+    condition     = aws_sns_topic.queue_events.archive_policy == null
+    error_message = "Con 0 días el tópico no archiva."
+  }
+}
+
+run "archivo_de_eventos_demasiado_largo" {
+  command = plan
+
+  variables {
+    events_archive_days = 400
+  }
+
+  expect_failures = [var.events_archive_days]
+}
+
 run "el_lake_recibe_solo_visitas_terminadas_particionadas_por_dia" {
   command = plan
 

@@ -80,7 +80,7 @@ Cada nodo del diagrama es un recurso que crea este Terraform.
 | API Gateway WebSocket | Actualizaciones en vivo del tablero y del ticket |
 | Lambda (10 funciones, Node 22) | `public` y `staff` atienden la API; `ws-connections` maneja los sockets; `stream-publisher`, `broadcaster`, `notifier` y `lifecycle` procesan eventos; `archiver` carga cada visita terminada en el data lake; `analytics-refresher` recalcula el tablero de análisis; `seed` carga la demo |
 | DynamoDB | `q-main`, tabla única con todo el negocio, los agregados del tablero de análisis y Streams; `q-connections`, los sockets abiertos |
-| SNS FIFO y SQS | El bus de eventos: cada cambio de una cola se publica en orden y se reparte a tres colas (`q-push`, `q-notifications` y `q-analytics`). Una cuarta, `q-lifecycle`, recibe los vencimientos de la gracia con demora. Cada una tiene su DLQ |
+| SNS FIFO y SQS | El bus de eventos: cada cambio de una cola se publica en orden y se reparte a tres colas (`q-push`, `q-notifications` y `q-analytics`). Una cuarta, `q-lifecycle`, recibe los vencimientos de la gracia con demora. Cada una tiene su DLQ. El tópico archiva cada evento durante 90 días y puede volver a entregarlo a una sola suscripción |
 | Cognito | Cuentas del staff: email verificado con un código, inicio de sesión con SRP (la contraseña no viaja) y tokens de una hora que se renuevan solos. API Gateway valida el token sin invocar ninguna Lambda |
 | Secrets Manager | La credencial del remitente SMTP de los mails (ver [Mails](#8-mails)) |
 | Data Firehose | Junta las visitas terminadas, las convierte a Parquet y las escribe en el data lake, en una carpeta por día |
@@ -270,6 +270,7 @@ lab. Todas tienen tipo y descripción, y casi todas validación.
 | `consumer_max_concurrency` | `2` | Ejecuciones simultáneas de cada consumidor |
 | `smtp_sender_email` | `null` | Cuenta de Gmail que manda los mails |
 | `ses_sender_email`, `ses_verified_recipients` | `null`, `[]` | SES, para una cuenta donde esté permitido |
+| `events_archive_days` | `90` | Días que el tópico de eventos guarda cada mensaje para poder reproducirlo (`0`, sin archivo) |
 | `waf_public_rate_limit` | `300` | Pedidos por IP cada 60 segundos a las rutas públicas, antes de que WAF bloquee |
 | `lake_buffer_seconds` | `60` | Cada cuánto escribe Firehose un archivo en el data lake |
 | `analytics_refresh_minutes` | `5` | Cada cuánto se recalculan los últimos días del tablero de análisis (los 90 días, una vez por día) |
@@ -464,7 +465,8 @@ Para eliminar toda la infraestructura y no dejar recursos consumiendo crédito e
    bloquea al destroy.
 2. En el pull request, agregar la etiqueta **`destroy`** y aprobar el job **Destroy** en `aws-lab`,
    igual que en el paso 3.
-3. El job destruye todos los recursos con Terraform, vacía y borra los cinco buckets y, por último,
+3. El job desactiva el archivo del tópico de eventos (AWS no deja borrar un tópico que archiva),
+   destruye todos los recursos con Terraform, vacía y borra los cinco buckets y, por último,
    borra el bucket del estado. El log termina con `Destroy complete!` y una línea `Vaciando y
    borrando:` por cada bucket.
 4. Quitar la etiqueta `destroy` del pull request, para que no vuelva a dispararse.
