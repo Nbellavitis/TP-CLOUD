@@ -181,7 +181,7 @@ def build(icons):
     s.node("lambda", c7, rE, "λ notifier", "escribe en q-main")
 
     # ------------------------------------------------------------ analítica
-    s.node("eventbridge", c2, rH, "EventBridge", "cada 5 minutos")
+    s.node("eventbridge", c2, rH, "EventBridge", "cada 5 min y diaria")
     s.node("lambda", c3, rH, "λ analytics-\nrefresher", "guarda en q-main")
     s.node("athena", c4, rH, "Athena", "tope de 1 GB")
     s.node("s3", c5, rH, "S3 lake", "Parquet por día")

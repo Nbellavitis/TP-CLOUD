@@ -86,7 +86,7 @@ Cada nodo del diagrama es un recurso que crea este Terraform.
 | Data Firehose | Junta las visitas terminadas, las convierte a Parquet y las escribe en el data lake, en una carpeta por día |
 | Glue Data Catalog | El esquema de la tabla de visitas. Firehose lo usa para convertir y Athena para consultar. Las particiones por día se calculan solas (*partition projection*), sin crawler |
 | Athena | SQL sobre el data lake: resume las visitas por local, día y fila. El workgroup corta cualquier consulta que escanee más de 1 GB |
-| EventBridge | Una regla que cada 5 minutos invoca a `analytics-refresher` |
+| EventBridge | Dos reglas que invocan a `analytics-refresher`: cada 5 minutos, para los últimos días, y una vez por día, para los 90 |
 | S3 | Cinco buckets privados: el sitio, el código de las Lambdas, el data lake, los resultados de Athena y los logs de acceso. Más el del estado de Terraform |
 | CloudWatch | Logs de las funciones y alarmas que avisan por SNS: mensajes en una DLQ, cola atrasada, fallas o atraso del stream, el tablero de análisis que no se recalcula y visitas que Firehose no pudo cargar |
 
@@ -119,8 +119,9 @@ Cada nodo del diagrama es un recurso que crea este Terraform.
 8. **Firehose** junta las visitas, las convierte a Parquet con el esquema de **Glue** y las escribe
    en **S3 lake**, en la carpeta del día en que terminó cada una.
 9. Cada 5 minutos, **EventBridge** invoca a **`λ analytics-refresher`**, que le pide a **Athena** un
-   resumen de los últimos 90 días por local, día y fila, y lo guarda en `q-main`. El tablero de
-   análisis del panel lee ese resumen a través de `λ staff`, en milisegundos y sin consultar a Athena.
+   resumen de hoy y ayer por local, día y fila, y lo guarda en `q-main`: los días cerrados no cambian.
+   Una vez por día, de madrugada, recalcula los 90 días enteros. El tablero de análisis del panel lee
+   ese resumen a través de `λ staff`, en milisegundos y sin consultar a Athena.
 10. Un mensaje que falla todos sus reintentos cae en la **DLQ** de su cola. Una alarma de
     **CloudWatch** avisa por **SNS `q-alerts`** al mail del equipo, igual que si el stream se atrasa,
     si el tablero deja de recalcularse o si Firehose no puede cargar una visita.
@@ -271,7 +272,7 @@ lab. Todas tienen tipo y descripción, y casi todas validación.
 | `ses_sender_email`, `ses_verified_recipients` | `null`, `[]` | SES, para una cuenta donde esté permitido |
 | `waf_public_rate_limit` | `300` | Pedidos por IP cada 60 segundos a las rutas públicas, antes de que WAF bloquee |
 | `lake_buffer_seconds` | `60` | Cada cuánto escribe Firehose un archivo en el data lake |
-| `analytics_refresh_minutes` | `5` | Cada cuánto se recalcula el tablero de análisis |
+| `analytics_refresh_minutes` | `5` | Cada cuánto se recalculan los últimos días del tablero de análisis (los 90 días, una vez por día) |
 | `athena_scan_limit_mb` | `1024` | Lo máximo que puede escanear una consulta de Athena |
 | `demo_history_days` | `90` | Días de visitas inventadas que se cargan en el data lake para la demo (`0`, ninguno) |
 

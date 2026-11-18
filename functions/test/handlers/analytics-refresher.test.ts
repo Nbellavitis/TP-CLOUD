@@ -12,7 +12,7 @@ const HEADER = [
 const row = (date: string) => ['est-1', date, 'q1', 'Mesas', '2', '1', '1', '0', '600', '1', '900', '1', '3', '60', '1', '1', '{"10":1}', '{"113":2}', '1772463600000']
 const asRows = (values: string[][]) => values.map((data) => ({ Data: data.map((value) => ({ VarCharValue: value })) }))
 
-function fakes(states: string[], pages: string[][][]) {
+function fakes(states: string[], pages: string[][][], fullRequested = false) {
   const started: StartQueryExecutionCommand['input'][] = []
   const written: DailyAggregate[][] = []
   let polls = 0
@@ -39,6 +39,9 @@ function fakes(states: string[], pages: string[][][]) {
       async putDays(days) {
         written.push([...days])
       },
+      async fullRefreshRequested() {
+        return fullRequested
+      },
     },
     workgroup: 'q-analitica',
     database: 'q_analitica',
@@ -56,8 +59,22 @@ describe('analytics-refresher', () => {
     const result = await refresh(deps)
     expect(started[0]).toMatchObject({ WorkGroup: 'q-analitica', QueryExecutionContext: { Database: 'q_analitica' } })
     expect(started[0]?.QueryString).toContain(`dt >= '2025-12-02'`)
-    expect(result).toEqual({ queryExecutionId: 'qe-1', since: '2025-12-02', days: 2, bytesScanned: 1234 })
+    expect(result).toEqual({ window: 'full', queryExecutionId: 'qe-1', since: '2025-12-02', days: 2, bytesScanned: 1234 })
     expect(written[0]?.map((day) => day.date)).toEqual(['2026-03-01', '2026-03-02'])
+  })
+
+  it('la vuelta corta solo recalcula los últimos días', async () => {
+    const { deps, started } = fakes(['SUCCEEDED'], [[HEADER, row('2026-03-02')]])
+    const result = await refresh(deps, undefined, 'recent')
+    expect(started[0]?.QueryString).toContain(`dt >= '2026-02-28'`)
+    expect(result).toMatchObject({ window: 'recent', since: '2026-02-28' })
+  })
+
+  it('con un pedido de recálculo completo vigente, la vuelta corta recalcula todo', async () => {
+    const { deps, started } = fakes(['SUCCEEDED'], [[HEADER]], true)
+    const result = await refresh(deps, undefined, 'recent')
+    expect(started[0]?.QueryString).toContain(`dt >= '2025-12-02'`)
+    expect(result).toMatchObject({ window: 'full', since: '2025-12-02', days: 0 })
   })
 
   it('falla, sin escribir nada, si la consulta falla', async () => {

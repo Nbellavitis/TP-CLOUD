@@ -75,7 +75,7 @@ flowchart LR
     archiver --> firehose[Data Firehose]
     firehose -->|Parquet, one folder per day| lake[(S3: lake)]
     firehose -.->|schema| glue[(Glue Data Catalog)]
-    schedule[EventBridge, every 5 min] --> refresher[λ analytics-refresher]
+    schedule[EventBridge, every 5 min and daily] --> refresher[λ analytics-refresher]
     refresher -->|SQL| athena[Athena]
     athena -.-> glue
     athena --> lake
@@ -108,7 +108,7 @@ Two paths, and the line between them is the DynamoDB transaction:
 | Data Firehose | Loads every finished visit into the lake, as Parquet, one folder per day | Managed batching and JSON-to-Parquet conversion; no cluster, pay per GB |
 | Glue Data Catalog | The schema of the visits table | Firehose converts with it and Athena reads with it; partition projection makes new days visible without a crawler |
 | Athena | Summarises the lake by establishment, day and queue | Pay per query on data already in S3. Redshift would be a cluster running all day for one query every five minutes |
-| EventBridge | Runs the analytics refresher every five minutes | The serverless way to schedule a function |
+| EventBridge | Runs the analytics refresher: the last days every five minutes, the whole window once a day | The serverless way to schedule a function |
 | S3 | The site, the function bundles, the data lake, Athena's results, and the access logs of the other four | Private buckets, as the TP2's correction asked |
 | CloudWatch | Logs of every function; alarms on every DLQ, on the push queue's age, on the stream's failures and lag, on the analytics refresher's errors and on Firehose's failed deliveries | Built in; the alarms publish to an SNS topic |
 
@@ -178,7 +178,7 @@ release reaches the notifier, which tells each customer the queue closed.
 | `notifier` | SQS `q-notifications` | Decides which notifications are due and sends them, once each: through Gmail's SMTP server in the Learner Lab, which denies SES |
 | `lifecycle` | SQS `q-lifecycle` | Applies due grace periods and releases closed queues in batches |
 | `archiver` | SQS `q-analytics`, filtered to the events that end a visit | Builds the visit's fact row from the finished entry and sends it to Firehose |
-| `analytics-refresher` | EventBridge, every five minutes | Asks Athena for the daily aggregates of the last 90 days and stores them in `q-main` for the panel |
+| `analytics-refresher` | EventBridge: every five minutes, and once a day | Asks Athena for the daily aggregates — today and yesterday every five minutes, the whole 90 days once a day — and stores them in `q-main` for the panel |
 | `seed` | Invoked by Terraform on apply | Loads the demo establishment, queues and lanes, idempotently, and the demo's visit history into the lake |
 
 The split follows two cuts, and only two:
@@ -483,7 +483,7 @@ creating one. Procedure in [deployment.md](deployment.md).
 * **One race test is flaky**, about once in 30 runs, without a reproduced cause; it is not the
   optimistic control, which is what it tests.
 * **The analytics dashboard lags by minutes**: Firehose writes every 60 seconds and the refresher runs
-  every five minutes. It also recalculates the whole 90-day window on every run, which is cheap at the
-  lab's scale but would not be with hundreds of establishments; recalculating only today and yesterday
-  often, and the full window once a day, would fix it.
+  every five minutes. A fact that reaches a day older than yesterday — a duplicate delivery, or the demo
+  history — waits for the daily full run, except right after the demo history is loaded, when the seed
+  asks for full runs for 30 minutes.
 * **No frontend tests.**

@@ -5,7 +5,8 @@
 #                                                                  │                    │
 #                                       Glue Data Catalog ◀────────┘                    │
 #                                              │                                         │
-#   EventBridge (cada N min) ─▶ λ analytics-refresher ─▶ Athena ◀─────────────────────────┘
+#   EventBridge (cada N min y   ─▶ λ analytics-refresher ─▶ Athena ◀──────────────────────┘
+#     una vez por día)
 #                                              │
 #                                              └─▶ DynamoDB q-main (agregados por día) ─▶ λ staff ─▶ panel
 #
@@ -22,9 +23,10 @@
 #   - catálogo: la tabla de Glue es el esquema de esos archivos. Firehose lo usa para convertir, y
 #     Athena para consultarlos sin moverlos de S3 (schema-on-read).
 #
-# Athena calcula, pero no atiende al panel: responde en segundos y cobra por dato escaneado. Cada
-# pocos minutos el refresher le pide un resumen por local, día y cola y lo guarda en DynamoDB; el
-# tablero lee de ahí (functions/src/analytics/aggregates.ts). Para preguntas que el tablero no
+# Athena calcula, pero no atiende al panel: responde en segundos y cobra por dato escaneado. El
+# refresher le pide un resumen por local, día y cola y lo guarda en DynamoDB; el tablero lee de ahí
+# (functions/src/analytics/aggregates.ts). Cada pocos minutos recalcula solo los últimos días, que son
+# los únicos que cambian, y una vez por día la ventana entera. Para preguntas que el tablero no
 # contesta, la tabla se consulta directamente con SQL desde la consola de Athena, con el mismo workgroup.
 
 locals {
@@ -235,19 +237,47 @@ resource "aws_athena_workgroup" "analytics" {
   }
 }
 
-# El refresher cada N minutos. EventBridge invoca la función directamente: el permiso de abajo es lo
-# único que necesita.
+# El refresher, con dos reglas de EventBridge que solo cambian qué ventana recalcula (`window`). La
+# función invoca directamente: el permiso de cada regla es lo único que necesita.
+#
+#   - cada N minutos, la vuelta corta: hoy y ayer. Es lo que cambia mientras los locales atienden;
+#   - una vez por día, de madrugada en Argentina, la vuelta completa: los 90 días del tablero. Corrige
+#     una visita que llegó tarde o repetida a un día viejo.
+#
+# Recalcular 90 días cada 5 minutos reescribía en cada vuelta un ítem por local y por día, aunque los
+# días cerrados no cambian: la vuelta corta escanea y escribe un 97 % menos.
+locals {
+  analytics_refresh_rules = {
+    recent = {
+      name        = format("%s-analytics-refresh", var.project)
+      description = "Recalcula los últimos días del tablero de análisis."
+      schedule    = var.analytics_refresh_minutes == 1 ? "rate(1 minute)" : format("rate(%d minutes)", var.analytics_refresh_minutes)
+    }
+    full = {
+      name        = format("%s-analytics-refresh-full", var.project)
+      description = "Recalcula la ventana entera del tablero de análisis, una vez por día."
+      # 07:00 UTC son las 04:00 en Argentina: con los locales cerrados.
+      schedule = "cron(0 7 * * ? *)"
+    }
+  }
+}
+
 resource "aws_cloudwatch_event_rule" "analytics_refresh" {
-  name                = format("%s-analytics-refresh", var.project)
-  description         = "Recalcula los agregados del tablero de análisis."
-  schedule_expression = var.analytics_refresh_minutes == 1 ? "rate(1 minute)" : format("rate(%d minutes)", var.analytics_refresh_minutes)
+  for_each = local.analytics_refresh_rules
+
+  name                = each.value.name
+  description         = each.value.description
+  schedule_expression = each.value.schedule
 }
 
 resource "aws_cloudwatch_event_target" "analytics_refresh" {
-  rule = aws_cloudwatch_event_rule.analytics_refresh.name
-  arn  = module.workers["analytics-refresher"].arn
+  for_each = local.analytics_refresh_rules
 
-  # Si una invocación falla, la próxima vuelta recalcula todo igual: no hace falta reintentar mucho.
+  rule  = aws_cloudwatch_event_rule.analytics_refresh[each.key].name
+  arn   = module.workers["analytics-refresher"].arn
+  input = jsonencode({ window = each.key })
+
+  # Si una invocación falla, la próxima vuelta recalcula igual: no hace falta reintentar mucho.
   retry_policy {
     maximum_retry_attempts       = 2
     maximum_event_age_in_seconds = 300
@@ -255,9 +285,28 @@ resource "aws_cloudwatch_event_target" "analytics_refresh" {
 }
 
 resource "aws_lambda_permission" "analytics_refresh" {
-  statement_id  = "EventBridgeRecalculaAgregados"
+  for_each = local.analytics_refresh_rules
+
+  statement_id  = each.key == "recent" ? "EventBridgeRecalculaAgregados" : "EventBridgeRecalculaTodo"
   action        = "lambda:InvokeFunction"
   function_name = module.workers["analytics-refresher"].name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.analytics_refresh.arn
+  source_arn    = aws_cloudwatch_event_rule.analytics_refresh[each.key].arn
+}
+
+# La regla, su destino y su permiso eran recursos sueltos antes de que existiera la vuelta diaria: así
+# el despliegue que ya existe los conserva como la vuelta corta, en lugar de borrarlos y recrearlos.
+moved {
+  from = aws_cloudwatch_event_rule.analytics_refresh
+  to   = aws_cloudwatch_event_rule.analytics_refresh["recent"]
+}
+
+moved {
+  from = aws_cloudwatch_event_target.analytics_refresh
+  to   = aws_cloudwatch_event_target.analytics_refresh["recent"]
+}
+
+moved {
+  from = aws_lambda_permission.analytics_refresh
+  to   = aws_lambda_permission.analytics_refresh["recent"]
 }

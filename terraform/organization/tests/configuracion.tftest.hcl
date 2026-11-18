@@ -220,8 +220,18 @@ run "athena_recalcula_el_tablero_con_un_tope_de_escaneo" {
   command = plan
 
   assert {
-    condition     = aws_cloudwatch_event_rule.analytics_refresh.schedule_expression == "rate(5 minutes)"
-    error_message = "Por defecto los agregados se recalculan cada 5 minutos."
+    condition     = aws_cloudwatch_event_rule.analytics_refresh["recent"].schedule_expression == "rate(5 minutes)"
+    error_message = "Por defecto los últimos días se recalculan cada 5 minutos."
+  }
+
+  assert {
+    condition     = jsondecode(aws_cloudwatch_event_target.analytics_refresh["recent"].input).window == "recent" && jsondecode(aws_cloudwatch_event_target.analytics_refresh["full"].input).window == "full"
+    error_message = "La regla frecuente pide la vuelta corta y la diaria la ventana entera."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.analytics_refresh["full"].schedule_expression == "cron(0 7 * * ? *)"
+    error_message = "La ventana entera se recalcula una vez por día, de madrugada en Argentina."
   }
 
   assert {
@@ -243,7 +253,7 @@ run "recalculo_cada_un_minuto" {
   }
 
   assert {
-    condition     = aws_cloudwatch_event_rule.analytics_refresh.schedule_expression == "rate(1 minute)"
+    condition     = aws_cloudwatch_event_rule.analytics_refresh["recent"].schedule_expression == "rate(1 minute)"
     error_message = "EventBridge pide el singular para un minuto."
   }
 }

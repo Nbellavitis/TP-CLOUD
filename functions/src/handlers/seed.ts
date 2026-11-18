@@ -23,6 +23,7 @@ import { staff } from '../domain/state.js'
 import type { Lane } from '../domain/types.js'
 import { createTableConfig } from '../persistence/client.js'
 import type { TableConfig } from '../persistence/client.js'
+import { AnalyticsStore } from '../persistence/analytics-store.js'
 import { DirectoryStore } from '../persistence/directory-store.js'
 import { QueueStore } from '../persistence/queue-store.js'
 
@@ -98,7 +99,15 @@ export interface HistoryDependencies {
   deliveryStreamName: string
   /** Espera entre reintentos; los tests la anulan. */
   pause?: (milliseconds: number) => Promise<void>
+  /** Donde se pide el recálculo completo del tablero, para que el historial aparezca enseguida. */
+  analytics?: { requestFullRefresh(until: Date): Promise<void> }
 }
+
+/**
+ * Cuánto dura el pedido de recálculo completo que deja el historial: lo máximo que puede tardar
+ * Firehose en escribir (15 minutos) más un par de vueltas del refresher.
+ */
+export const HISTORY_FULL_REFRESH_MINUTES = 30
 
 const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
 
@@ -124,7 +133,10 @@ export async function sendFacts(facts: readonly VisitFact[], deps: HistoryDepend
 }
 
 export async function seedHistory(input: HistoryInput, deps: HistoryDependencies, now = new Date()): Promise<{ visits: number }> {
-  return { visits: await sendFacts(historicalFacts(input, now), deps) }
+  const visits = await sendFacts(historicalFacts(input, now), deps)
+  // Son días viejos: la vuelta corta del refresher no los miraría hasta la completa de la madrugada.
+  await deps.analytics?.requestFullRefresh(new Date(now.getTime() + HISTORY_FULL_REFRESH_MINUTES * 60_000))
+  return { visits }
 }
 
 export const handler = async (input: SeedInput | { history: HistoryInput }): Promise<SeedResult | { visits: number }> => {
@@ -132,6 +144,7 @@ export const handler = async (input: SeedInput | { history: HistoryInput }): Pro
     const result = await seedHistory(input.history, {
       firehose: new FirehoseClient({}),
       deliveryStreamName: required('DELIVERY_STREAM_NAME'),
+      analytics: new AnalyticsStore(createTableConfig()),
     })
     console.log('Historial de demo', JSON.stringify(result))
     return result

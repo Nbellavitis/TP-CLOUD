@@ -5,7 +5,7 @@
 //
 // Un local y un rango son una sola consulta por clave: a lo sumo 90 ítems chicos.
 
-import { BatchWriteCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
+import { BatchWriteCommand, GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
 import type { DailyAggregate } from '../analytics/aggregates.js'
 import { figuresFrom } from '../analytics/aggregates.js'
 import type { AnalyticsFigures, AnalyticsQuery, AnalyticsSource } from '../analytics/dashboard.js'
@@ -47,6 +47,35 @@ export class AnalyticsStore implements AnalyticsSource {
         if (pending.length > 0) await this.pause(100 * 2 ** attempt)
       }
     }
+  }
+
+  /**
+   * Pide que el refresher recalcule la ventana entera, y no solo los últimos días, hasta `until`. Lo
+   * usa el historial de demo: carga días viejos, que la vuelta corta no mira. El plazo cubre lo que
+   * tarda Firehose en escribirlos.
+   */
+  async requestFullRefresh(until: Date): Promise<void> {
+    await this.table.documents.send(
+      new PutCommand({
+        TableName: this.table.tableName,
+        Item: {
+          PK: keys.ANALYTICS_REFRESH_PK,
+          SK: keys.ANALYTICS_FULL_SK,
+          kind: 'ANALYTICS_FULL_REFRESH',
+          until: until.toISOString(),
+          // Vencido, el pedido ya no hace nada: el TTL solo lo limpia.
+          ttl: keys.epochSeconds(until) + 24 * 3600,
+        },
+      }),
+    )
+  }
+
+  /** Si hay un pedido de recálculo completo vigente. */
+  async fullRefreshRequested(now: Date): Promise<boolean> {
+    const { Item } = await this.table.documents.send(
+      new GetCommand({ TableName: this.table.tableName, Key: { PK: keys.ANALYTICS_REFRESH_PK, SK: keys.ANALYTICS_FULL_SK } }),
+    )
+    return typeof Item?.['until'] === 'string' && Item['until'] > now.toISOString()
   }
 
   async days(establishmentId: string, from: string, to: string): Promise<DailyAggregate[]> {

@@ -58,3 +58,6 @@ export const epochSeconds = (date: Date) => Math.floor(date.getTime() / 1000)
 /** Los agregados diarios de un local para el tablero de análisis, uno por día local (AAAA-MM-DD). */
 export const analyticsPk = (establishmentId: string) => `ANALYTICS#${establishmentId}`
 export const analyticsDaySk = (date: string) => `DAY#${date}`
+/** El pedido de recálculo completo del tablero (lo deja el historial de demo). Uno solo en la tabla. */
+export const ANALYTICS_REFRESH_PK = 'ANALYTICS_REFRESH'
+export const ANALYTICS_FULL_SK = 'FULL'
