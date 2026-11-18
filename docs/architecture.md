@@ -1,6 +1,6 @@
 # Q — Architecture, Design and Decisions
 
-How the system is built, as deployed for the Tercera Entrega, and why. The design it was built from
+How the system is built, as deployed for the Cuarta Entrega, and why. The design it was built from
 is [arquitectura-serverless.md](historial/arquitectura-serverless.md) (in Spanish); where the build deviates
 from it, the "Ajustes al diseño" table in [ROADMAP.md](historial/ROADMAP.md#ajustes-al-diseño) says so and
 why. The previous architecture — Spring Boot on EC2 behind a load balancer, with PostgreSQL on RDS —
@@ -22,10 +22,12 @@ contact, and follows their place from their phone; staff call, serve and manage 
 panel. The scope is the MVP of *Funcionalidades 1-5* of the proposal: joining by QR, following the
 wait, notifications, managing the line, and leaving or not showing up.
 
-The Tercera Entrega asks for the architecture to be implemented with Terraform and deployed from a
+The Tercera Entrega asked for the architecture to be implemented with Terraform and deployed from a
 GitHub Actions pipeline, into an AWS Academy Learner Lab account that the cátedra must be able to
 reproduce from the README. Those two constraints — Terraform from a pipeline, and the lab's limits —
-shape the deployment as much as the application does.
+shape the deployment as much as the application does. The Cuarta Entrega added WAF in front of the
+REST API, email-verified staff accounts with SRP sign-in, and the historical analytics: a data lake
+loaded by Firehose, catalogued by Glue and summarised by Athena.
 
 ---
 
@@ -39,7 +41,8 @@ flow chart below is the same system reduced to its data flow.
 
 ```mermaid
 flowchart LR
-    browser([Browser]) -->|HTTPS| rest[API Gateway REST]
+    browser([Browser]) -->|HTTPS| waf{{WAF}}
+    waf --> rest[API Gateway REST]
     browser <-->|WSS| ws[API Gateway WebSocket]
     browser -->|sign up / sign in| cognito[Cognito]
 
@@ -57,6 +60,7 @@ flowchart LR
     publisher -->|delayed| lifecycleq[[SQS q-lifecycle]]
     topic --> pushq[[SQS FIFO q-push]]
     topic -->|filtered| notifq[[SQS q-notifications]]
+    topic -->|visit ended| analyticsq[[SQS q-analytics]]
 
     pushq --> broadcaster[λ broadcaster]
     notifq --> notifier[λ notifier]
@@ -66,6 +70,16 @@ flowchart LR
     notifier -->|SMTP over TLS| gmail[Gmail]
     notifier -.->|reads the app password| secrets[(Secrets Manager)]
     lifecycle --> main
+
+    analyticsq --> archiver[λ archiver]
+    archiver --> firehose[Data Firehose]
+    firehose -->|Parquet, one folder per day| lake[(S3: lake)]
+    firehose -.->|schema| glue[(Glue Data Catalog)]
+    schedule[EventBridge, every 5 min] --> refresher[λ analytics-refresher]
+    refresher -->|SQL| athena[Athena]
+    athena -.-> glue
+    athena --> lake
+    refresher -->|daily aggregates| main
 ```
 
 Two paths, and the line between them is the DynamoDB transaction:
@@ -74,24 +88,29 @@ Two paths, and the line between them is the DynamoDB transaction:
   domain rules in memory, and writes everything that changed — including the events describing the
   change — in one transaction conditioned on the queue's version. The response goes back at once.
 * **Asynchronous.** Everything else starts from those event items: the live push, the emails, the
-  grace timer, and releasing a closed queue. Consumers have independent queues and retries, so a
+  grace timer, releasing a closed queue, and loading the data lake. Consumers have independent queues and retries, so a
   downstream failure does not roll back the committed change. Delivery limits are described in §6.
 
 ### Components at a glance
 
 | Component | Role | Why this and not something else |
 |---|---|---|
+| WAF | A per-IP rate limit on the public routes and AWS's managed rules, in front of the REST API | Stops a flood before it invokes a Lambda; the managed rules cover common web attacks without writing them |
 | API Gateway REST | Serves the static site from S3 and the API on the same origin | CloudFront is blocked in the lab; this is the only HTTPS entry that can serve a private bucket. Same origin also means no CORS |
 | API Gateway WebSocket | Holds the browsers' connections; Lambda only runs on connect, disconnect, and to push | Push without polling, and without a server holding sockets |
-| 9 Lambdas, TypeScript on Node 22 | The API, the consumers, the seed, the Cognito trigger | Short cold starts without SnapStart; one language with the frontend; small single-file bundles |
+| 10 Lambdas, TypeScript on Node 22 | The API, the consumers, the analytics, the seed | Short cold starts without SnapStart; one language with the frontend; small single-file bundles |
 | DynamoDB `q-main` | Every item but the users, in one table | Every operation is per queue; one partition per queue gives transactions over a queue's items and ordered reads by prefix |
 | DynamoDB Streams | The source of every asynchronous action | Fires for committed writes; ordering is guaranteed per item |
 | SNS FIFO + SQS | Fan-out, filtering and buffering per consumer | Each consumer gets its own queue, retries, DLQ and concurrency limit |
 | Cognito | Staff accounts | Removes the hand-rolled login, password hashing and the JWT secret; API Gateway validates tokens without running a Lambda |
 | Gmail SMTP | Notification emails | The lab denies SES to every role. Gmail's SMTP server delivers to any address, with the group's account and an app password |
 | Secrets Manager | That app password, the only secret | Encrypted at rest and read with the lab's role; the pipeline writes the value, so it is in no file, plan or state |
-| S3 | The site, the function bundles, and the access logs of both | Three private buckets, as the TP2's correction asked |
-| CloudWatch | Logs of every function, alarms on every DLQ, on the push queue's age and on the stream's failures | Built in; the alarms publish to an SNS topic |
+| Data Firehose | Loads every finished visit into the lake, as Parquet, one folder per day | Managed batching and JSON-to-Parquet conversion; no cluster, pay per GB |
+| Glue Data Catalog | The schema of the visits table | Firehose converts with it and Athena reads with it; partition projection makes new days visible without a crawler |
+| Athena | Summarises the lake by establishment, day and queue | Pay per query on data already in S3. Redshift would be a cluster running all day for one query every five minutes |
+| EventBridge | Runs the analytics refresher every five minutes | The serverless way to schedule a function |
+| S3 | The site, the function bundles, the data lake, Athena's results, and the access logs of the other four | Private buckets, as the TP2's correction asked |
+| CloudWatch | Logs of every function; alarms on every DLQ, on the push queue's age, on the stream's failures and lag, on the analytics refresher's errors and on Firehose's failed deliveries | Built in; the alarms publish to an SNS topic |
 
 **There is no VPC.** Nothing in the design needs one: DynamoDB, SNS, SQS, Secrets Manager and Cognito are
 reached over AWS's public endpoints with IAM, and there is no database instance or server to
@@ -158,8 +177,9 @@ release reaches the notifier, which tells each customer the queue closed.
 | `broadcaster` | SQS FIFO `q-push` | Pushes the current board and tickets to the connections watching a queue |
 | `notifier` | SQS `q-notifications` | Decides which notifications are due and sends them, once each: through Gmail's SMTP server in the Learner Lab, which denies SES |
 | `lifecycle` | SQS `q-lifecycle` | Applies due grace periods and releases closed queues in batches |
-| `seed` | Invoked by Terraform on apply | Loads the demo establishment, queues and lanes, idempotently |
-| `cognito-pre-signup` | Cognito pre sign-up | Confirms new accounts on the spot, so sign-up has no code step |
+| `archiver` | SQS `q-analytics`, filtered to the events that end a visit | Builds the visit's fact row from the finished entry and sends it to Firehose |
+| `analytics-refresher` | EventBridge, every five minutes | Asks Athena for the daily aggregates of the last 90 days and stores them in `q-main` for the panel |
+| `seed` | Invoked by Terraform on apply | Loads the demo establishment, queues and lanes, idempotently, and the demo's visit history into the lake |
 
 The split follows two cuts, and only two:
 
@@ -172,7 +192,7 @@ The split follows two cuts, and only two:
   and only need a handful of routes; staff are few, authenticated, and use everything. Different
   exposure, different alarms, and the customer's path does not load the panel's code.
 
-One function per endpoint was rejected: some 35 functions would each keep their own warm instances,
+One function per endpoint was rejected: some 36 functions would each keep their own warm instances,
 so most invocations would start cold, and the usual advantage — a least-privilege role per function —
 does not exist in the lab, where every function runs as `LabRole`. Splitting by entity was rejected
 because what changes together would be in different functions: calling someone writes the entry and
@@ -193,7 +213,8 @@ shape it:
   change to a queue is a transaction inside one partition, and the board is one query.
 * **The sort key encodes the entry's state.** `W#<orderKey>` for waiting, `A#<entryId>` for called or
   being served, `F#<finishedAt>#<entryId>` for finished. The line is a prefix query already in order;
-  the metrics for a date range are a range query on `F#`. Nothing is aggregated in advance.
+  the panel's live metrics are a range query on `F#`. Only the historical dashboard reads aggregates
+  computed in advance (`ANALYTICS#`, one item per establishment and day), which Athena recalculates.
 * **Order keys are fractional strings**, so inserting between neighbours never renumbers the line.
 * **Events have their own partition per queue**, ordered by the queue's version, and expire after 30
   days through TTL. Only their insertion matters to the stream.
@@ -294,20 +315,22 @@ implementation limitation, not a recovery guarantee.
 
 ### 8.1 Two audiences, two models
 
-* **Staff** sign up and sign in against Cognito from the site's own pages, with
-  `USER_PASSWORD_AUTH` and no hosted UI. The id token goes in `Authorization` and API Gateway's Cognito
-  authorizer validates it before any function runs. Tokens last a 12-hour shift.
+* **Staff** sign up and sign in against Cognito from the site's own pages, with SRP
+  (`USER_SRP_AUTH`, the only flow the client allows) and no hosted UI. Sign-up confirms the email with
+  a code Cognito sends. The id token goes in `Authorization` and API Gateway's Cognito authorizer
+  validates it before any function runs. Tokens last one hour and the browser renews them with the
+  refresh token during a 12-hour session.
 
   **Why the Lambda callback workaround from class does not apply.** That workaround exists because
   Cognito's hosted UI redirects back with the tokens (or a `code`) to a callback URL that must be
   HTTPS, and a site on S3 website hosting is plain HTTP; a `/callback` behind API Gateway and a Lambda
   bridges the two. Neither condition holds here. There is no redirect: the sign-in form is ours and
-  calls Cognito's `InitiateAuth` directly over TLS, and Cognito returns the tokens in that response, so
+  calls Cognito's `InitiateAuth` and `RespondToAuthChallenge` directly over TLS, and Cognito returns the tokens in that response, so
   there is no callback URL and no `code` to exchange. And the site is not on HTTP: API Gateway serves it
   at a fixed `https://…execute-api…/prod/` address, so even with the hosted UI the callback could point
   straight at one of our pages. What we give up without the hosted UI is its ready-made social sign-in
-  and MFA and recovery screens; in exchange, the password goes from the browser to Cognito and never
-  passes through our functions. The id token, not the access token, goes to the API because the Cognito
+  and MFA and recovery screens; in exchange, the password never leaves the browser: SRP proves it to
+  Cognito without sending it, and it never passes through our functions. The id token, not the access token, goes to the API because the Cognito
   authorizer validates it as is; the access token would need OAuth scopes configured on every method.
 * **Customers** have no account. Their ticket token — unguessable, in the link they are emailed — is
   their whole credential, and it only shows their own place in line.
@@ -336,7 +359,9 @@ but does not remove that value from those files. Access to state and artifacts m
 
 ### 8.4 Abuse limits
 
-API Gateway throttles every route below what the lab's Lambda concurrency can serve, so a burst gets
+WAF, in front of the REST API, blocks an IP that sends more than 300 requests a minute to the public
+routes, and applies AWS's managed rules against common web attacks, known bad inputs and IPs with a
+bad reputation. Behind it, API Gateway throttles every route below what the lab's Lambda concurrency can serve, so a burst gets
 429 instead of failing invocations. The two routes anyone can write to — join and leave — have a lower
 limit, and joining is also limited per IP per minute in the function. The site's files have a higher
 limit of their own: they invoke no Lambda, and a crowd scanning the same QR requests hundreds of them
@@ -347,6 +372,8 @@ at once.
 * The staff token is in `localStorage`, readable by any script on the page. A static site on API
   Gateway has no server of its own to hold an `HttpOnly` cookie.
 * Per-function least privilege is impossible in the lab: every function runs as `LabRole`.
+* The WebSocket API cannot be associated with WAF. Connecting already requires a ticket token or a
+  one-time staff ticket.
 * The per-IP join limit trusts API Gateway's view of the source IP, which is right, but many
   customers behind one NAT share it.
 
@@ -389,7 +416,7 @@ translation is a compile error.
 
 ## 11. Testing strategy
 
-**132 tests, in two tiers**, run on every push by the pipeline:
+**Two tiers of tests**, run on every push by the pipeline:
 
 * **Unit** (`functions/test/domain`, `handlers`, `notifications`) — the pure rules: ordering keys,
   the selector, estimation, lanes, requeue, metrics; plus the stream publisher and the Gmail mailer
@@ -413,7 +440,7 @@ Terraform, run only by GitHub Actions on the pull request: validate and build on
 with the lab's credentials, apply the saved plan after an approval, destroy with a label. The state
 is in an S3 bucket per account with native locking. Three of our own modules (`private-bucket`,
 `lambda-function`, `queue-with-dlq`) and one external (`terraform-aws-modules/dynamodb-table`). The
-pipeline creates the three S3 buckets itself, because the lab denies a read the provider needs after
+pipeline creates the five S3 buckets itself, because the lab denies a read the provider needs after
 creating one. Procedure in [deployment.md](deployment.md).
 
 ---
@@ -431,12 +458,15 @@ creating one. Procedure in [deployment.md](deployment.md).
 | Notifications | Decided from state by a consumer | Inside the staff transaction (the TP2): one movement can make dozens cross a threshold, which does not fit in a transaction |
 | Live updates | API Gateway WebSocket | Server-Sent Events: need a process holding the connection. Polling alone: slower and more invocations |
 | Staff auth | Cognito, validated by API Gateway | A Lambda authorizer and our own JWT: a secret to store, password hashing to maintain, and an invocation for every request the cache misses |
-| Staff sign-in | Our own form, `USER_PASSWORD_AUTH` against Cognito | The hosted UI with a `/callback` Lambda (the workaround from class): it solves an HTTP site needing an HTTPS redirect, and ours is already HTTPS with no redirect at all (§8.1) |
+| Staff sign-in | Our own form, SRP against Cognito | The hosted UI with a `/callback` Lambda (the workaround from class): it solves an HTTP site needing an HTTPS redirect, and ours is already HTTPS with no redirect at all (§8.1) |
 | Channels | Email, through Gmail's SMTP server in the Learner Lab (SES where allowed) | SES alone: the lab denies it to every role, so nothing would be delivered. Web Push, which the design proposed: a service worker and VAPID keys. SMS: sandboxed |
 | Serving the site | API Gateway from a private S3 bucket | CloudFront: blocked in the lab. S3 website hosting: needs a public bucket, and plain HTTP |
 | Grace expiry | Delayed SQS message, plus lazy on read and write | Only lazy (the read path): a queue nobody looks at would never move. Only the timer: a page could show a call the clock already invalidated |
 | Bucket creation | The pipeline, with the AWS CLI | `aws_s3_bucket`: fails in the lab, the SCP denies a read the provider makes after creating it |
 | Function split | By trigger, then by audience in the API | One per endpoint, one for everything, by entity, CQRS (§4) |
+| Edge protection | WAF on the REST API | Only API Gateway throttling: global per route, it cannot single out one abusive IP |
+| Historical analytics | A data lake (Firehose, S3 in Parquet, Glue) queried by Athena | Scanning `q-main`: it is modelled per queue, not for months across every queue. Redshift: a cluster billing all day. QuickSight: the dashboard is per establishment and lives in the panel |
+| Serving the dashboard | Daily aggregates precomputed in DynamoDB | Querying Athena on every page load: seconds per answer and billed per data scanned. Aggregates are sums, counts and histograms, so any range is the sum of its days |
 
 ---
 
@@ -452,6 +482,8 @@ creating one. Procedure in [deployment.md](deployment.md).
   re-uploaded, and the REST API redeployed, even when the frontend did not change.
 * **One race test is flaky**, about once in 30 runs, without a reproduced cause; it is not the
   optimistic control, which is what it tests.
-* **Historical metrics are out of scope** for this delivery (Firehose, S3, Glue, Athena are future
-  work); the panel's numbers come from the finished entries of the last seven days at most.
+* **The analytics dashboard lags by minutes**: Firehose writes every 60 seconds and the refresher runs
+  every five minutes. It also recalculates the whole 90-day window on every run, which is cheap at the
+  lab's scale but would not be with hundreds of establishments; recalculating only today and yesterday
+  often, and the full window once a day, would fix it.
 * **No frontend tests.**

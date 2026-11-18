@@ -1,4 +1,4 @@
-# Queue — Tercera Entrega (IaC con Terraform)
+# Queue — Cuarta Entrega (demo final)
 
 ITBA 82.08 Cloud Computing · Grupo 9.
 
@@ -13,11 +13,30 @@ Queue es una plataforma de filas virtuales para restaurantes, comercios y cualqu
 la gente espera. El cliente escanea un QR, se anota con su nombre y un mail, y sigue su turno desde
 el celular. El staff maneja la fila desde un panel.
 
-En esta entrega la arquitectura del TP2 (Spring Boot en EC2 detrás de un balanceador, con RDS) pasó
-a ser **serverless**: Lambdas sobre DynamoDB, detrás de API Gateway. Se despliega **entera con
+En la tercera entrega la arquitectura del TP2 (Spring Boot en EC2 detrás de un balanceador, con RDS)
+pasó a ser **serverless**: Lambdas sobre DynamoDB, detrás de API Gateway. Se despliega **entera con
 Terraform desde un pipeline de GitHub Actions**, en una cuenta de AWS Academy Learner Lab.
 
+Para esta entrega se sumaron:
+
+* **Seguridad:** WAF delante de la API REST y cuentas del staff con email verificado e inicio de
+  sesión SRP.
+* **Análisis histórico:** cada visita terminada se guarda en un data lake (Firehose, S3 en Parquet y
+  Glue), Athena lo resume y el panel muestra el tablero de análisis.
+
 ## Dónde está cada punto de la consigna
+
+**Cuarta entrega**
+
+| Consigna | Sección |
+|---|---|
+| Diagrama de arquitectura que refleja la implementación | [Arquitectura](#2-arquitectura) |
+| Los componentes propuestos en la primera entrega | [La aplicación](#1-la-aplicación) |
+| Al menos un SQS o SNS | [Arquitectura](#2-arquitectura): el bus de eventos (SNS FIFO y cuatro colas SQS) |
+| Cognito | [Arquitectura](#2-arquitectura) · [Uso de la aplicación](#7-uso-de-la-aplicación) |
+| Guía para levantar la demo | [Guía paso a paso](#6-guía-paso-a-paso) |
+
+**Tercera entrega (Terraform)**
 
 | Consigna | Sección |
 |---|---|
@@ -43,6 +62,7 @@ Terraform desde un pipeline de GitHub Actions**, en una cuenta de AWS Academy Le
 | Notificaciones | Avisos por mail al anotarse, al acercarse el turno (por posición o por minutos) y cuando le toca |
 | Gestión de la fila | Tablero del staff: llamar, atender, ausente, pausar, cerrar; carriles por tamaño de grupo; métricas |
 | Abandono y gracia | El cliente puede salir de la fila; si no se presenta, un período de gracia y una política de ausencia deciden qué pasa |
+| Análisis histórico | Tablero de los últimos 30 o 90 días: visitas, espera promedio y p90, abandono, ausentes, qué tan bien se estimó la espera, llegadas por día y hora, y cada fila por separado |
 | Idiomas | Castellano e inglés, según el navegador; los mails llegan en el idioma en que se anotó el cliente |
 
 ---
@@ -55,20 +75,25 @@ Cada nodo del diagrama es un recurso que crea este Terraform.
 
 | Servicio | Para qué |
 |---|---|
+| WAF | Delante de la API REST: un tope de 300 pedidos por minuto por IP en las rutas públicas y las reglas administradas de AWS (ataques web comunes, entradas maliciosas conocidas, IPs con mala reputación) |
 | API Gateway REST | Una sola URL HTTPS para el sitio (leído del bucket privado con `LabRole`) y para la API `/api/v1`. Throttling por ruta |
 | API Gateway WebSocket | Actualizaciones en vivo del tablero y del ticket |
-| Lambda (8 funciones, Node 22) | `public` y `staff` atienden la API; `ws-connections` maneja los sockets; `stream-publisher`, `broadcaster`, `notifier` y `lifecycle` procesan eventos; `seed` carga la demo |
-| DynamoDB | `q-main`, tabla única con todo el negocio y Streams; `q-connections`, los sockets abiertos |
-| SNS FIFO y SQS | El bus de eventos: cada cambio de una cola se publica en orden y se reparte a tres colas, cada una con su DLQ |
+| Lambda (10 funciones, Node 22) | `public` y `staff` atienden la API; `ws-connections` maneja los sockets; `stream-publisher`, `broadcaster`, `notifier` y `lifecycle` procesan eventos; `archiver` carga cada visita terminada en el data lake; `analytics-refresher` recalcula el tablero de análisis; `seed` carga la demo |
+| DynamoDB | `q-main`, tabla única con todo el negocio, los agregados del tablero de análisis y Streams; `q-connections`, los sockets abiertos |
+| SNS FIFO y SQS | El bus de eventos: cada cambio de una cola se publica en orden y se reparte a tres colas (`q-push`, `q-notifications` y `q-analytics`). Una cuarta, `q-lifecycle`, recibe los vencimientos de la gracia con demora. Cada una tiene su DLQ |
 | Cognito | Cuentas del staff: email verificado con un código, inicio de sesión con SRP (la contraseña no viaja) y tokens de una hora que se renuevan solos. API Gateway valida el token sin invocar ninguna Lambda |
-| Secrets Manager | La contraseña del SMTP de Gmail para los mails (ver [Mails](#8-mails)) |
-| S3 | Tres buckets privados: el sitio, el código de las Lambdas y los logs de acceso. Más el del estado de Terraform |
-| CloudWatch | Logs de las funciones y alarmas (mensajes en una DLQ, cola atrasada, fallas del stream) que avisan por SNS |
+| Secrets Manager | La credencial del remitente SMTP de los mails (ver [Mails](#8-mails)) |
+| Data Firehose | Junta las visitas terminadas, las convierte a Parquet y las escribe en el data lake, en una carpeta por día |
+| Glue Data Catalog | El esquema de la tabla de visitas. Firehose lo usa para convertir y Athena para consultar. Las particiones por día se calculan solas (*partition projection*), sin crawler |
+| Athena | SQL sobre el data lake: resume las visitas por local, día y fila. El workgroup corta cualquier consulta que escanee más de 1 GB |
+| EventBridge | Una regla que cada 5 minutos invoca a `analytics-refresher` |
+| S3 | Cinco buckets privados: el sitio, el código de las Lambdas, el data lake, los resultados de Athena y los logs de acceso. Más el del estado de Terraform |
+| CloudWatch | Logs de las funciones y alarmas que avisan por SNS: mensajes en una DLQ, cola atrasada, fallas o atraso del stream, el tablero de análisis que no se recalcula y visitas que Firehose no pudo cargar |
 
 **Flujo de datos**, recorriendo el diagrama:
 
 1. El navegador pide el sitio a **API Gateway REST**, que lo lee del bucket privado **S3 spa** con
-   `LabRole`. Junto con el sitio baja `config.json`, que Terraform genera con los ids de Cognito y la
+   `LabRole`. Todo pedido a la API REST pasa antes por **WAF**. Junto con el sitio baja `config.json`, que Terraform genera con los ids de Cognito y la
    URL del WebSocket.
 2. El staff se registra contra **Cognito** y confirma su email con el código que le llega. Inicia
    sesión con SRP, que demuestra la contraseña sin enviarla, y Cognito devuelve tokens de una hora
@@ -82,15 +107,23 @@ Cada nodo del diagrama es un recurso que crea este Terraform.
 5. **DynamoDB Streams** entrega cada evento a **`λ stream-publisher`**, que lo publica en **SNS
    FIFO**, en orden por cola. Cada llamado va además a **SQS `q-lifecycle`** con una demora igual al
    período de gracia, y cada cierre de cola, sin demora.
-6. SNS reparte cada evento a dos colas:
+6. SNS reparte cada evento a tres colas:
    * **SQS `q-push`** → **`λ broadcaster`** lee el estado actual y lo empuja por el WebSocket al
      tablero del staff y al ticket de cada cliente.
-   * **SQS `q-notifications`** → **`λ notifier`** decide qué avisos corresponden, toma la contraseña
+   * **SQS `q-notifications`** → **`λ notifier`** decide qué avisos corresponden, toma la credencial
      de **Secrets Manager** y manda los mails por el **SMTP de Gmail**.
+   * **SQS `q-analytics`**, que solo recibe los eventos que terminan una visita (atendido, salió o
+     ausente) → **`λ archiver`** arma la fila de la visita y la manda a **Firehose**.
 7. **`λ lifecycle`** aplica la política de ausencia cuando vence la gracia, o libera la cola cerrada,
    escribiendo en `q-main`. Ese cambio vuelve a entrar por el paso 5.
-8. Un mensaje que falla todos sus reintentos cae en la **DLQ** de su cola. Una alarma de
-   **CloudWatch** avisa por **SNS `q-alerts`** al mail del equipo.
+8. **Firehose** junta las visitas, las convierte a Parquet con el esquema de **Glue** y las escribe
+   en **S3 lake**, en la carpeta del día en que terminó cada una.
+9. Cada 5 minutos, **EventBridge** invoca a **`λ analytics-refresher`**, que le pide a **Athena** un
+   resumen de los últimos 90 días por local, día y fila, y lo guarda en `q-main`. El tablero de
+   análisis del panel lee ese resumen a través de `λ staff`, en milisegundos y sin consultar a Athena.
+10. Un mensaje que falla todos sus reintentos cae en la **DLQ** de su cola. Una alarma de
+    **CloudWatch** avisa por **SNS `q-alerts`** al mail del equipo, igual que si el stream se atrasa,
+    si el tablero deja de recalcularse o si Firehose no puede cargar una visita.
 
 **Sin VPC.** No hay servidores ni bases con IP privada que proteger: todos los servicios son
 regionales y administrados por AWS (multi-AZ), y las funciones los usan por HTTPS, autorizadas por
@@ -145,7 +178,8 @@ responsabilidad:
 | `storage.tf`, `site.tf` | Configuración de los buckets, objetos del sitio y `config.json` |
 | `tables.tf` | Las dos tablas de DynamoDB (módulo externo) |
 | `functions.tf`, `auth.tf` | Lambdas y sus disparadores SQS; Cognito |
-| `api.tf`, `openapi.tf`, `realtime.tf` | API REST (desde un documento OpenAPI) y API WebSocket |
+| `api.tf`, `openapi.tf`, `realtime.tf`, `waf.tf` | API REST (desde un documento OpenAPI), API WebSocket y WAF |
+| `analytics.tf` | Data lake: Firehose, la tabla de Glue, el workgroup de Athena y la regla de EventBridge |
 | `events.tf`, `monitoring.tf`, `notifications.tf` | Bus de eventos, alarmas, secreto SMTP e identidades SES opcionales |
 | `seed.tf`, `seed/demo.json` | Usuario y datos de demo |
 
@@ -156,9 +190,9 @@ además la cuenta y la región, así no chocan en ninguna cuenta.
 
 | Módulo | Tipo | Se usa en | Qué encapsula |
 |---|---|---|---|
-| [`lambda-function`](terraform/modules/lambda-function/README.md) | Propio | 8 funciones (`functions.tf`) | Empaqueta el bundle (`archive_file`), lo sube versionado al bucket de código, crea la función y su log group con retención. Devuelve nombre, ARN, ARN de invocación y hash del código |
-| [`private-bucket`](terraform/modules/private-bucket/README.md) | Propio | 3 buckets (`storage.tf`) | Sobre un bucket existente: bloqueo de acceso público, propiedad de objetos, versionado, ciclo de vida y logs opcionales, y una política que exige TLS |
-| [`queue-with-dlq`](terraform/modules/queue-with-dlq/README.md) | Propio | 3 colas (`events.tf`) | Cola estándar o FIFO con su DLQ, redrive, permiso para que SNS publique y alarmas de DLQ y de atraso |
+| [`lambda-function`](terraform/modules/lambda-function/README.md) | Propio | 10 funciones (`functions.tf`) | Empaqueta el bundle (`archive_file`), lo sube versionado al bucket de código, crea la función y su log group con retención. Devuelve nombre, ARN, ARN de invocación y hash del código |
+| [`private-bucket`](terraform/modules/private-bucket/README.md) | Propio | 5 buckets (`storage.tf`) | Sobre un bucket existente: bloqueo de acceso público, propiedad de objetos, versionado, ciclo de vida y logs opcionales, y una política que exige TLS |
+| [`queue-with-dlq`](terraform/modules/queue-with-dlq/README.md) | Propio | 4 colas (`events.tf`) | Cola estándar o FIFO con su DLQ, redrive, permiso para que SNS publique y alarmas de DLQ y de atraso |
 | [`terraform-aws-modules/dynamodb-table/aws`](https://registry.terraform.io/modules/terraform-aws-modules/dynamodb-table/aws/5.5.2) | Externo, versión `5.5.2` fija | 2 tablas (`tables.tf`) | Claves, índice secundario, TTL, Streams y PITR |
 
 Cada módulo propio tiene su README, con las decisiones de diseño, un ejemplo de uso y la referencia
@@ -195,7 +229,7 @@ Se usan los cuatro:
 
 | Meta-argumento | Ejemplo | Para qué |
 |---|---|---|
-| `for_each` | `for_each = local.queues` en `events.tf` | Una cola por clave del mapa (`push`, `notifications`, `lifecycle`). También las funciones, los buckets, los objetos del sitio, las rutas y las suscripciones |
+| `for_each` | `for_each = local.queues` en `events.tf` | Una cola por clave del mapa (`push`, `notifications`, `lifecycle`, `analytics`). También las funciones, los buckets, los objetos del sitio, las rutas y las suscripciones |
 | `count` | `count = var.demo_enabled ? 1 : 0` en `seed.tf` | Recursos opcionales: los datos de demo, la suscripción de alarmas, el secreto SMTP y las opciones de los módulos |
 | `depends_on` | `depends_on = [aws_cloudwatch_log_group.this]` en `modules/lambda-function/main.tf` | Dependencias que ninguna referencia expresa: el log group antes de la función, y el bloqueo de acceso público de un bucket antes de su política |
 | `lifecycle` | `create_before_destroy = true` en `api.tf` y `realtime.tf` | El deployment nuevo de cada API existe antes de borrar el que usa el stage, así la API no queda sin servir |
@@ -204,7 +238,7 @@ Se usan los cuatro:
 
 [`locals.tf`](terraform/organization/locals.tf) deriva todo lo que no es una entrada: el sufijo de cuenta y
 región, los tags, los nombres de los buckets, los mapas de funciones y de colas, los datos de demo y
-los objetos del sitio con su tipo MIME. [`openapi.tf`](terraform/organization/openapi.tf) arma las 35 rutas
+los objetos del sitio con su tipo MIME. [`openapi.tf`](terraform/organization/openapi.tf) arma las 36 rutas
 de la API desde dos listas: sumar un endpoint es sumar una línea.
 
 | Datasource | Para qué |
@@ -235,11 +269,16 @@ lab. Todas tienen tipo y descripción, y casi todas validación.
 | `consumer_max_concurrency` | `2` | Ejecuciones simultáneas de cada consumidor |
 | `smtp_sender_email` | `null` | Cuenta de Gmail que manda los mails |
 | `ses_sender_email`, `ses_verified_recipients` | `null`, `[]` | SES, para una cuenta donde esté permitido |
+| `waf_public_rate_limit` | `300` | Pedidos por IP cada 60 segundos a las rutas públicas, antes de que WAF bloquee |
+| `lake_buffer_seconds` | `60` | Cada cuánto escribe Firehose un archivo en el data lake |
+| `analytics_refresh_minutes` | `5` | Cada cuánto se recalcula el tablero de análisis |
+| `athena_scan_limit_mb` | `1024` | Lo máximo que puede escanear una consulta de Athena |
+| `demo_history_days` | `90` | Días de visitas inventadas que se cargan en el data lake para la demo (`0`, ninguno) |
 
 Outputs: `site_url`, `health_url`, `websocket_url`, `user_pool_id` y `user_pool_client_id` (acceso);
 `demo_queue_url`, `demo_staff_email` y `demo_staff_password` (sensitive); `bucket_names`,
 `main_table_name`, `connections_table_name`, `function_names`, `stream_mapping_uuid`,
-`smtp_secret_id` y `smtp_sender_email` (operación).
+`smtp_secret_id`, `smtp_sender_email`, `waf_web_acl_name` y `analytics` (operación).
 
 ### 4.7 Estado remoto y bloqueo
 
@@ -266,7 +305,7 @@ El estado vive en S3, en `tfstate-q-<cuenta>-<región>`, con la clave `queue/ter
 
 | Qué | Quién lo hace | Por qué |
 |---|---|---|
-| Los 3 buckets de la app | [`scripts/buckets.sh`](terraform/organization/scripts/buckets.sh), desde el pipeline, con los nombres que define Terraform | Después de crear un `aws_s3_bucket`, el provider lee su configuración de object lock y un SCP del lab niega esa lectura (`AccessDenied` con deny explícito). Terraform configura todo lo demás del bucket (módulo `private-bucket`) |
+| Los 5 buckets de la app | [`scripts/buckets.sh`](terraform/organization/scripts/buckets.sh), desde el pipeline, con los nombres que define Terraform | Después de crear un `aws_s3_bucket`, el provider lee su configuración de object lock y un SCP del lab niega esa lectura (`AccessDenied` con deny explícito). Terraform configura todo lo demás del bucket (módulo `private-bucket`) |
 | El bucket del estado | La acción `terraform-init` | Tiene que existir antes del `init` |
 | El valor de la contraseña SMTP | El job Apply, con la AWS CLI, después del apply | Por Terraform quedaría en texto plano en el plan guardado y en el estado |
 
@@ -284,7 +323,7 @@ with an explicit deny in a service control policy
 El provider hace esa lectura siempre, en todas las versiones que probamos (4.67, 5.100 y 6.67), y no
 hay ningún argumento que la evite. Por eso:
 
-1. El pipeline crea los tres buckets con `aws s3api create-bucket`, usando **los nombres que calcula
+1. El pipeline crea los cinco buckets con `aws s3api create-bucket`, usando **los nombres que calcula
    Terraform** (el output `bucket_names` del plan guardado): el nombre no se escribe dos veces.
 2. Terraform administra **todo lo demás** de cada bucket con el módulo `private-bucket`: bloqueo del
    acceso público, propiedad de los objetos, versionado, política con TLS obligatorio, registros de
@@ -399,11 +438,12 @@ request:
 3. **Aprobar el despliegue.** Al terminar el plan, el job **Apply** queda en espera. En la ejecución,
    presionar **Review deployments**, marcar `aws-lab` y presionar **Approve and deploy**.
 4. **El job Apply crea todo.** Ejecuta, en orden:
-   * **Creación de los buckets**: crea los tres buckets de la aplicación (`scripts/buckets.sh`), con
+   * **Creación de los buckets**: crea los cinco buckets de la aplicación (`scripts/buckets.sh`), con
      los nombres que define Terraform. El Learner Lab no deja crearlos desde Terraform (ver
      [4.8](#48-lo-que-no-crea-terraform-y-por-qué)).
    * **Terraform Apply**: aplica exactamente el plan aprobado. Crea las APIs, las Lambdas, las tablas,
-     las colas, Cognito y las alarmas, sube el sitio y carga los datos de demo.
+     las colas, Cognito, el WAF, el data lake y las alarmas, sube el sitio y carga los datos de demo,
+     con 90 días de visitas inventadas para que el tablero de análisis tenga qué mostrar.
    * **Contraseña SMTP**: si se configuró en el paso 1, la guarda en Secrets Manager.
    * **Prueba de humo**: comprueba que la API responda, que el sitio cargue, que un cliente pueda
      anotarse en la cola de demo y que los cambios lleguen por WebSocket. Si algo falla, el job
@@ -423,7 +463,7 @@ Para eliminar toda la infraestructura y no dejar recursos consumiendo crédito e
    bloquea al destroy.
 2. En el pull request, agregar la etiqueta **`destroy`** y aprobar el job **Destroy** en `aws-lab`,
    igual que en el paso 3.
-3. El job destruye todos los recursos con Terraform, vacía y borra los tres buckets y, por último,
+3. El job destruye todos los recursos con Terraform, vacía y borra los cinco buckets y, por último,
    borra el bucket del estado. El log termina con `Destroy complete!` y una línea `Vaciando y
    borrando:` por cada bucket.
 4. Quitar la etiqueta `destroy` del pull request, para que no vuelva a dispararse.
@@ -493,6 +533,9 @@ como staff y otra como cliente.
    * **Pausar** y **Reanudar** dejan de tomar gente nueva sin cerrar la fila; **Cerrar** la cierra y
      libera a todos.
 6. **Mirar las métricas** en el panel: atendidos hoy, tiempo de llegada a llamado y ausentes.
+7. **Ver el análisis** (**Análisis** en el menú del panel): el tablero de los últimos 30 o 90 días.
+   Con el usuario de demo ya tiene 90 días de historial. Una visita que termina aparece unos minutos
+   después: lo que tarda Firehose en escribirla más la próxima vuelta del recálculo.
 
 ### Como cliente
 
@@ -525,7 +568,7 @@ lo que la consigna permite. El código de SES sigue disponible para una cuenta d
 
 | Corrección | Cómo quedó |
 |---|---|
-| **Separar el bucket privado en tres** | `spa` (el sitio), `artifacts` (el código de las Lambdas, versionado) y `logs` (registros de acceso de los otros dos). Los tres privados, con TLS obligatorio, por el módulo `private-bucket` |
+| **Separar el bucket privado en tres** | `spa` (el sitio), `artifacts` (el código de las Lambdas, versionado) y `logs` (registros de acceso de los otros dos). Los tres privados, con TLS obligatorio, por el módulo `private-bucket`. Con el análisis histórico se sumaron `lake` y `athena`, con la misma configuración y sus accesos también en `logs` |
 | **«Falta encriptar»: contraseñas en texto plano en el `.env`** | Ninguna contraseña vive en un archivo de configuración: Cognito reemplazó el JWT propio, DynamoDB no tiene contraseña y los servicios se usan con IAM. El único secreto (la contraseña de Gmail) está cifrado en Secrets Manager y fuera del estado de Terraform |
 | **Justificar RDS con el nuevo cómputo** | Elegimos DynamoDB por los patrones de acceso por cola, la capacidad bajo demanda y la integración con Streams. Evita administrar conexiones SQL y simplifica la infraestructura de esta aplicación |
 | **Justificar el pub/sub con el nuevo cómputo** | El `LISTEN/NOTIFY` de PostgreSQL coordinaba varias instancias de EC2. Sin servidores, cada cambio se publica desde el stream de DynamoDB en SNS FIFO (en orden por cola) y se reparte a colas SQS, cada una con su consumidor, su DLQ y su alarma |
@@ -542,7 +585,7 @@ severidad alta que se dejan a propósito están marcados en el código con un co
 
 | Hallazgo | Decisión |
 |---|---|
-| Colas SQS sin cifrar (HIGH) | **Resuelto.** Las tres colas, sus DLQs y la de fallas del stream declaran `sqs_managed_sse_enabled = true`: cifrado en reposo con la clave que administra SQS, sin KMS ni costo |
+| Colas SQS sin cifrar (HIGH) | **Resuelto.** Las cuatro colas, sus DLQs y la de fallas del stream declaran `sqs_managed_sse_enabled = true`: cifrado en reposo con la clave que administra SQS, sin KMS ni costo |
 | Tablas DynamoDB sin cifrado (HIGH) | DynamoDB cifra **siempre** en reposo, con una clave de AWS. tfsec pide además una clave KMS, que agrega costo por pedido y no cambia qué datos quedan protegidos |
 | Tópicos SNS sin cifrar (HIGH) | Un mensaje vive en SNS solo hasta entregarse a las colas SQS, que sí están cifradas. En `q-alerts`, además, las alarmas de CloudWatch no pueden publicar en un tópico cifrado con la clave administrada de AWS: harían falta una clave KMS propia y su política |
 | API Gateway sin access logs (MEDIUM) | Cada función deja sus logs en CloudWatch, y API Gateway publica sus métricas. Los access logs necesitan un rol de CloudWatch para toda la cuenta, que no se probó en el Learner Lab |

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Diagrama de arquitectura de Queue (TP3), con la convención de AWS: AWS Cloud, la región y los
+Diagrama de arquitectura de Queue (TP4), con la convención de AWS: AWS Cloud, la región y los
 servicios conectados entre sí. Lo de afuera de AWS (el navegador, GitHub Actions, Gmail) queda
 afuera del borde. Cada nodo es un recurso del Terraform de terraform/organization.
 
@@ -23,7 +23,7 @@ OPS = "#3b4a54"     # despliegue y operación
 ALERT = "#b0202f"
 FONT = "DejaVu Sans, Verdana, Geneva, sans-serif"
 
-W, H = 1720, 1500
+W, H = 2000, 2010
 ICON = 64
 TITLE = 20     # nombre de cada servicio
 SUB = 15       # su detalle
@@ -123,12 +123,12 @@ def build(icons):
     s = Svg(icons)
     h = ICON / 2
 
-    # columnas y filas de la grilla
-    c1, c2, c3, c4, c5, c6 = 340, 560, 780, 1000, 1210, 1420
-    rA, rB, rC, rE, rF, rG = 255, 470, 680, 885, 1135, 1300
-    ext_l, ext_r = 110, 1640
+    # columnas y filas de la grilla. c0 es el borde (WAF); c7, el tercer consumidor de SNS.
+    c0, c1, c2, c3, c4, c5, c6, c7 = 315, 450, 655, 860, 1065, 1270, 1475, 1680
+    rA, rB, rC, rE, rH, rI, rF, rG = 255, 470, 680, 885, 1190, 1395, 1610, 1780
+    ext_l, ext_r = 110, 1905
 
-    s.text(30, 46, "Queue · arquitectura en AWS (TP3)", 30, weight="bold")
+    s.text(30, 46, "Queue · arquitectura en AWS (TP4)", 30, weight="bold")
     s.text(30, 76, "Serverless · desplegada con Terraform desde GitHub Actions · AWS Academy Learner Lab · Grupo 9",
            16, MUTED)
 
@@ -142,8 +142,10 @@ def build(icons):
         lx += 50 + len(label) * 8.6 + 40
 
     # ------------------------------------------------------------ bordes
-    s.group(220, 135, 1330, 1290, CLOUD, "AWS Cloud", icon=cloud_icon)
-    s.group(245, 185, 1280, 1215, REGION, "Región us-east-1  ·  sin VPC", icon=region_icon, dash="9 6")
+    s.group(220, 135, 1590, 1795, CLOUD, "AWS Cloud", icon=cloud_icon)
+    s.group(245, 185, 1540, 1720, REGION, "Región us-east-1  ·  sin VPC", icon=region_icon, dash="9 6")
+    s.box(c2 - 120, rH - 80, c6 - c2 + 245, rI - rH + 215, SYNC, "#f3faf9", "6 5", 1.6)
+    s.text(c2 - 108, rH - 54, "Analítica · data lake", 18, SYNC, weight="bold")
 
     # ------------------------------------------------------------ afuera de AWS
     s.node("user", ext_l, rB, "Navegador", "cliente y staff")
@@ -153,9 +155,9 @@ def build(icons):
     s.mail(ext_r, rG, "Mail del\nequipo", "alarmas")
 
     # ------------------------------------------------------------ entrada, API y datos
-    s.node("cognito", c1, rA, "Cognito", "cuentas del staff")
-    s.node("lambda", c2, rA, "λ cognito-pre-signup", "confirma el alta")
-    s.node("lambda", c3, rA, "λ seed", "datos de demo")
+    s.node("waf", c0, rB, "WAF", "tope por IP")
+    s.node("cognito", c1, rA, "Cognito", "staff · SRP")
+    s.node("lambda", c3, rA, "λ seed", "demo e historial")
     s.node("apigw", c1, rB, "API Gateway\nREST", "sitio + /api/v1")
     s.node("lambda", c2, rB, "λ staff", "panel y llamados")
     s.node("ddb", c3, rB, "DynamoDB\nq-main", "tabla única")
@@ -171,15 +173,26 @@ def build(icons):
     s.node("sns", c6, rB, "SNS FIFO", "q-queue-events")
     s.node("sqs", c4, rC, "SQS\nq-lifecycle", "demora = gracia")
     s.node("sqs", c5, rC, "SQS FIFO\nq-push", "orden por cola")
-    s.node("sqs", c6, rC, "SQS\nq-notifications", "filtro por tipo")
+    s.node("sqs", c6, rC, "SQS\nq-analytics", "fin de visita")
+    s.node("sqs", c7, rC, "SQS\nq-notifications", "filtro por tipo")
     s.node("lambda", c4, rE, "λ lifecycle", "escribe en q-main")
     s.node("lambda", c5, rE, "λ broadcaster", "lee q-main")
-    s.node("lambda", c6, rE, "λ notifier", "escribe en q-main")
+    s.node("lambda", c6, rE, "λ archiver", "lee q-main")
+    s.node("lambda", c7, rE, "λ notifier", "escribe en q-main")
+
+    # ------------------------------------------------------------ analítica
+    s.node("eventbridge", c2, rH, "EventBridge", "cada 5 minutos")
+    s.node("lambda", c3, rH, "λ analytics-\nrefresher", "guarda en q-main")
+    s.node("athena", c4, rH, "Athena", "tope de 1 GB")
+    s.node("s3", c5, rH, "S3 lake", "Parquet por día")
+    s.node("firehose", c6, rH, "Data\nFirehose", "JSON a Parquet")
+    s.node("s3", c4, rI, "S3 athena", "resultados")
+    s.node("glue", c5, rI, "Glue Data\nCatalog", "esquema, sin crawler")
 
     # ------------------------------------------------------------ transversales
     s.node("iam", c2, rF, "IAM LabRole", "rol de todo", color=OPS)
     s.node("cw", c3, rF, "CloudWatch\nLogs", "logs de las λ", color=OPS)
-    s.node("secrets", c6, rF, "Secrets\nManager", "clave SMTP")
+    s.node("secrets", c7, rF, "Secrets\nManager", "credencial SMTP")
     s.node("s3", c1, rG, "S3 artifacts", "código de las λ", color=OPS)
     s.node("s3", c2, rG, "S3 logs", "access logs", color=OPS)
     s.node("s3", c3, rG, "S3 tfstate", "estado", color=OPS)
@@ -189,17 +202,16 @@ def build(icons):
 
     # ------------------------------------------------------------ pedidos del usuario
     s.line([(ext_l + h, rB - 14), (c1 - h, rA + 12)], REQ)
-    s.chip(220, 365, "login", REQ)
-    s.line([(ext_l + h, rB), (c1 - h, rB)], REQ)
+    s.chip(280, 365, "login", REQ)
+    s.line([(ext_l + h, rB), (c0 - h, rB)], REQ)
     s.chip(222, rB - 6, "HTTPS", REQ)
-    s.line([(ext_l + h, rB + 14), (c1 - h, rE - 12)], REQ)
-    s.chip(222, 690, "wss", REQ)
-    s.line([(c1, rB - h), (c1, rA + h + 46)], REQ)
+    s.line([(c0 + h, rB), (c1 - h, rB)], REQ)
+    s.line([(ext_l + h, rB + 14), (200, rB + 14), (c1 - h, rE - 12)], REQ)
+    s.chip(300, 690, "wss", REQ)
+    s.line([(c1, rB - h), (c1, rA + h + 58)], REQ)
     s.chip(c1, 375, "valida el token", REQ)
-    s.line([(c1 + h, rA), (c2 - h, rA)], REQ)
-    s.chip(450, rA - 8, "trigger", REQ)
     s.line([(c2 - h + 4, rB - h), (c1 + h, rA + 18)], REQ)
-    s.chip(497, 400, "alta de miembros", REQ)
+    s.chip(602, 412, "alta de miembros", REQ)
     s.line([(c1 + h, rB), (c2 - h, rB)], REQ)
     s.line([(c1 + h, rB + 14), (c2 - h, rC - 10)], REQ)
     s.line([(c1, rB + h + 84), (c1, rC - h)], REQ)
@@ -208,7 +220,7 @@ def build(icons):
     # ------------------------------------------------------------ datos
     s.line([(c2 + h, rB), (c3 - h, rB)], SYNC)
     s.line([(c2 + h, rC - 10), (c3 - h, rB + 14)], SYNC)
-    s.line([(c3, rA + h + 46), (c3, rB - h)], SYNC)
+    s.line([(c3, rA + h + 58), (c3, rB - h)], SYNC)
     s.line([(c2 + h, rE), (c3 - h, rE)], SYNC)
 
     # ------------------------------------------------------------ eventos
@@ -216,11 +228,12 @@ def build(icons):
     s.line([(c4 + h, rB), (c5 - h, rB)], BUS)
     s.line([(c5 + h, rB), (c6 - h, rB)], BUS)
     s.line([(c5 - 10, rB + h + 32), (c4 + h, rC - h)], BUS)
-    s.chip(1090, 595, "llamados y cierres", BUS)
+    s.chip(1160, 595, "llamados y cierres", BUS)
     s.line([(c6 - 10, rB + h + 70), (c5 + h, rC - h)], BUS)
     s.line([(c6, rB + h + 70), (c6, rC - h)], BUS)
-    for c in (c4, c5, c6):
-        s.line([(c, rC + h + 70), (c, rE - h)], BUS)
+    s.line([(c6 + 10, rB + h + 70), (c7 - h, rC - h)], BUS)
+    for c in (c4, c5, c6, c7):
+        s.line([(c, rC + h + 80), (c, rE - h)], BUS)
 
     # lifecycle se reprograma si la gracia supera los 15 minutos de demora de SQS
     s.line([(c4 - h, rE - 10), (c4 - 80, rE - 10), (c4 - 80, rC + 10), (c4 - h, rC + 10)], BUS)
@@ -229,11 +242,25 @@ def build(icons):
     # broadcaster: lee las conexiones y empuja por el WebSocket
     s.line([(c5, rE + h + 70), (c5, 1010), (c3, 1010), (c3, rE + h + 74)], SYNC)
     s.line([(c5 - 20, rE + h + 70), (c5 - 20, 1040), (275, 1040), (275, rE + 12), (c1 - h, rE + 12)], BUS)
-    s.chip(660, 1032, "push al navegador", BUS)
+    s.chip(760, 1032, "push al navegador", BUS)
 
     # notifier
-    s.line([(c6, rE + h + 70), (c6, rF - h)], SYNC)
-    s.line([(c6 + h, rE), (ext_r - 32, rE)], BUS)
+    s.line([(c7, rE + h + 70), (c7, rF - h)], SYNC)
+    s.line([(c7 + h, rE), (ext_r - 32, rE)], BUS)
+
+    # analítica: el archiver carga el lake; EventBridge dispara el recálculo con Athena
+    s.line([(c6, rE + h + 70), (c6, rH - h)], SYNC)
+    s.chip(c6, 1085, "una fila por visita", SYNC)
+    s.line([(c6 - h, rH), (c5 + h, rH)], SYNC)
+    s.chip(1372, rH - 8, "Parquet", SYNC)
+    s.line([(c2 + h, rH), (c3 - h, rH)], BUS)
+    s.line([(c3 + h, rH), (c4 - h, rH)], SYNC)
+    s.chip(962, rH - 8, "SQL", SYNC)
+    s.line([(c4 + h, rH), (c5 - h, rH)], SYNC)
+    s.line([(c4, rH + h + 75), (c4, rI - h)], SYNC)
+    s.line([(c6 - 24, rH + h + 98), (c5 + h, rI - 12)], SYNC, dash="7 5")
+    s.chip(1395, 1352, "esquema", SYNC)
+    s.line([(c4 + 24, rH + h + 75), (c5 - h, rI - 12)], SYNC, dash="7 5")
 
     # alarmas
     s.line([(c4 + h, rG), (c5 - h, rG)], ALERT)
@@ -245,15 +272,15 @@ def build(icons):
     s.chip(178, rF - 8, "buckets", OPS)
     s.line([(ext_l, rF + h + 70), (ext_l, rG - h)], OPS)
     s.line([(ext_l + h, rG), (c1 - h, rG)], OPS)
-    s.chip(232, rG - 8, "sube el código", OPS)
+    s.chip(280, rG - 8, "sube el código", OPS)
 
     # ------------------------------------------------------------ notas
     notes = [
         "Sin VPC: todos los servicios son regionales y administrados por AWS; las funciones los usan por HTTPS, con el rol LabRole.",
-        "Los 3 buckets de la app los crea el pipeline con la CLI (un SCP del lab bloquea aws_s3_bucket); Terraform configura todo lo demás.",
+        "Los 5 buckets de la app los crea el pipeline con la CLI (un SCP del lab bloquea aws_s3_bucket); Terraform configura todo lo demás.",
     ]
     for i, n in enumerate(notes):
-        s.text(30, 1455 + 24 * i, n, 15, MUTED)
+        s.text(30, 1965 + 24 * i, n, 15, MUTED)
     return s.render()
 
 
